@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
+
 app = Flask(__name__)
 app.secret_key = "your_secret_key"  # Used for session management
 
@@ -119,13 +119,15 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Chat UI</title>
+        <title>Robot Chat</title>
         <style>
-            body { font-family: Arial, sans-serif; background-color: #1e293b; color: white; text-align: center; padding: 20px; }
-            .chatbox { max-width: 600px; margin: auto; background: #334155; padding: 20px; border-radius: 15px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); }
-            input { width: 70%; padding: 12px; border-radius: 10px; border: none; }
-            button { width: 15%; padding: 12px; border-radius: 10px; border: none; background-color: #007bff; color: white; cursor: pointer; }
-            pre { text-align: left; background: #0f172a; padding: 15px; border-radius: 10px; color: #f1f5f9; overflow-x: auto; }
+            body { font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; text-align: center; padding: 20px; }
+            .chatbox { max-width: 800px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
+            input[type="text"] { width: 75%; padding: 15px; font-size: 16px; border-radius: 12px; border: none; margin: 10px 0; }
+            button { padding: 15px 20px; font-size: 16px; margin: 5px; border-radius: 12px; border: none; background-color: #007bff; color: white; cursor: pointer; transition: background-color 0.3s ease; }
+            button:hover { background-color: #0056b3; }
+            pre { text-align: left; background: #0f172a; padding: 20px; border-radius: 12px; color: #f1f5f9; overflow-x: auto; margin-top: 20px; font-size: 14px; }
+            a.logout { display: inline-block; margin-top: 20px; color: #ff5555; text-decoration: none; font-weight: bold; }
         </style>
         <script>
             let listening = false;
@@ -138,21 +140,55 @@ def home():
 
                 recognition.onresult = function(event) {
                     const transcript = event.results[event.results.length - 1][0].transcript.trim().toLowerCase();
+                    console.log("🎤 Heard:", transcript);
                     if (transcript.includes("robot")) {
-                        listening = true;
-                        console.log("✅ Trigger word 'robot' detected. Now listening for command...");
+                        console.log("✅ Trigger word 'robot' detected.");
                         recognition.stop();
-                        setTimeout(startListening, 500); // start command input
+                        startListening();
                     }
                 };
+
+                recognition.onend = function() {
+                    if (!listening) {
+                        console.log("🔄 Restarting trigger listener...");
+                        startTriggerWordListening();
+                    }
+                };
+
+                recognition.onerror = function(event) {
+                    console.log("⚠️ Speech recognition error:", event.error);
+                    recognition.stop();
+                    setTimeout(startTriggerWordListening, 2000);
+                };
+
                 recognition.start();
             }
 
             function startListening() {
+                listening = true;
                 const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+                recognition.lang = 'en-US';
+                recognition.interimResults = false;
+
                 recognition.onresult = function(event) {
-                    document.getElementById('command').value = event.results[0][0].transcript;
+                    const command = event.results[0][0].transcript.trim();
+                    console.log("🎙️ Command received:", command);
+                    document.getElementById('command').value = command;
+                    listening = false;
+                    document.getElementById('commandForm').requestSubmit();
                 };
+
+                recognition.onend = function() {
+                    listening = false;
+                    startTriggerWordListening();
+                };
+
+                recognition.onerror = function(event) {
+                    console.log("⚠️ Error during command listening:", event.error);
+                    listening = false;
+                    startTriggerWordListening();
+                };
+
                 recognition.start();
             }
 
@@ -179,15 +215,17 @@ def home():
     </head>
     <body>
         <div class="chatbox">
-            <h1>Robot Chat</h1>
+            <h1>🤖 Robot Chat</h1>
             <form id="commandForm" method="POST" action="/send_command">
                 <input type="text" id="command" name="command" placeholder="Enter movement command..." required>
-                <button type="button" onclick="startListening()">🎤</button>
-                <button type="submit">Send</button>
+                <div>
+                    <button type="button" onclick="startListening()">🎤 Speak</button>
+                    <button type="submit">Send</button>
+                </div>
             </form>
-            <h2>Generated Robot Commands:</h2>
+            <h2>🧠 Generated Robot Commands:</h2>
             <pre id="response"></pre>
-            <a href="/logout" style="display: block; margin-top: 10px; color: #ff4444; text-decoration: none;">Logout</a>
+            <a class="logout" href="/logout">🚪 Logout</a>
         </div>
     </body>
     </html>
