@@ -619,7 +619,7 @@ ROBOT_INTERFACE_HTML = """
         document.addEventListener('DOMContentLoaded', function() {
             initSpeechRecognition();
             
-            // Handle form submission
+            // Handle form submission with improved error handling
             document.getElementById('commandForm').addEventListener('submit', function(event) {
                 event.preventDefault();
                 let formData = new FormData(this);
@@ -631,7 +631,13 @@ ROBOT_INTERFACE_HTML = """
                     method: 'POST',
                     body: formData
                 })
-                .then(response => response.json())
+                .then(response => {
+                    // Check if the response is OK before attempting to parse JSON
+                    if (!response.ok) {
+                        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     const output = JSON.stringify(data, null, 4);
                     document.getElementById('response').textContent = output;
@@ -641,7 +647,7 @@ ROBOT_INTERFACE_HTML = """
                     visualizeCommand(data);
                 })
                 .catch(error => {
-                    document.getElementById('response').textContent = "⚠️ Error: " + error;
+                    document.getElementById('response').textContent = "⚠️ Error: " + error.message;
                     document.getElementById('responseStatus').textContent = "Error";
                 });
             });
@@ -779,32 +785,39 @@ def home():
 @login_required
 @rate_limit
 def send_command():
-    command = request.form.get('command', '').strip()
-    user = session.get('user')
-    
-    if not command:
-        return jsonify({"error": "No command provided"})
-    
-    # Get user command history
-    user_commands = []
-    if user in command_history:
-        user_commands = [entry.get("original_command", "") for entry in command_history[user] 
-                          if isinstance(entry, dict) and "original_command" in entry]
-    
-    # Process the command
-    response = interpret_command(command, user_commands)
-    
-    # Store command in history
-    if user not in command_history:
-        command_history[user] = []
-    
-    command_history[user].append({
-        "timestamp": time.time(),
-        "original_command": command,
-        "response": response
-    })
-    
-    return jsonify(response)
+    try:
+        command = request.form.get('command', '').strip()
+        user = session.get('user')
+        
+        if not command:
+            return jsonify({"error": "No command provided"})
+        
+        # Get user command history
+        user_commands = []
+        if user in command_history and isinstance(command_history[user], list):
+            user_commands = [entry.get("original_command", "") for entry in command_history[user] 
+                           if isinstance(entry, dict) and "original_command" in entry]
+        
+        # Process the command
+        response = interpret_command(command, user_commands)
+        
+        # Store command in history
+        if user not in command_history:
+            command_history[user] = []
+        
+        # Only store command data in history, not timestamps
+        if isinstance(command_history[user], list):
+            command_history[user].append({
+                "timestamp": time.time(),
+                "original_command": command,
+                "response": response
+            })
+        
+        return jsonify(response)
+    except Exception as e:
+        # Log the error but return it as JSON, not as an HTML error page
+        logger.error(f"Error processing command: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     # Configure host and port for Render deployment
