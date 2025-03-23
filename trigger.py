@@ -30,6 +30,8 @@ USERS = {
 
 # Command history for audit and improved responses
 command_history = {}
+# Add a separate rate limiting timestamps dictionary
+rate_limit_timestamps = {}
 
 # Rate limiting configuration
 rate_limits = {
@@ -46,7 +48,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Decorator for rate limiting
+# Updated decorator for rate limiting
 def rate_limit(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -58,24 +60,26 @@ def rate_limit(f):
         role = USERS[user].get('role', 'user')
         limit = rate_limits.get(role, rate_limits['user'])
         
-        # Initialize history if not exists
-        if user not in command_history:
-            command_history[user] = []
+        # Initialize timestamps for this user if they don't exist
+        if user not in rate_limit_timestamps:
+            rate_limit_timestamps[user] = []
         
-        # Clean up old requests
+        # Clean up old timestamps
         current_time = time.time()
-        command_history[user] = [t for t in command_history[user] 
-                                  if current_time - t < limit['period']]
+        rate_limit_timestamps[user] = [
+            t for t in rate_limit_timestamps[user] 
+            if current_time - t < limit['period']
+        ]
         
         # Check if limit exceeded
-        if len(command_history[user]) >= limit['requests']:
+        if len(rate_limit_timestamps[user]) >= limit['requests']:
             return jsonify({
                 "error": f"Rate limit exceeded. Maximum {limit['requests']} requests per {limit['period']//3600} hour(s).",
-                "retry_after": limit['period'] - (current_time - command_history[user][0])
+                "retry_after": limit['period'] - (current_time - rate_limit_timestamps[user][0])
             }), 429
         
         # Add current request timestamp
-        command_history[user].append(current_time)
+        rate_limit_timestamps[user].append(current_time)
         
         return f(*args, **kwargs)
     return decorated_function
@@ -200,9 +204,7 @@ LOGIN_HTML = """
             <input type="password" name="password" placeholder="Password" required>
             <button type="submit">Login</button>
         </form>
-        {% if error %}
-        <p class="error">{{ error }}</p>
-        {% endif %}
+        <p class="error" id="errorMsg" style="display: none;"></p>
     </div>
 </body>
 </html>
@@ -314,7 +316,7 @@ ROBOT_INTERFACE_HTML = """
             border-radius: 50%;
             margin: 0 auto;
             position: relative;
-            transition: all 0.3s ease;
+            transition: all 0.5s ease;
         }
         #robotFace.active {
             background-color: #0ea5e9;
@@ -329,7 +331,7 @@ ROBOT_INTERFACE_HTML = """
             background-color: #0f172a;
             border-radius: 50%;
             top: 30px;
-            transition: all 0.3s ease;
+            transition: all 0.5s ease;
         }
         #robotFace::before {
             left: 25px;
@@ -340,6 +342,8 @@ ROBOT_INTERFACE_HTML = """
         #robotFace.active::before,
         #robotFace.active::after {
             background-color: #ffffff;
+            width: 22px;
+            height: 22px;
         }
         .mouth {
             position: absolute;
@@ -349,11 +353,11 @@ ROBOT_INTERFACE_HTML = """
             bottom: 25px;
             left: calc(50% - 20px);
             border-radius: 10px;
-            transition: all 0.3s ease;
+            transition: all 0.5s ease;
         }
         #robotFace.active .mouth {
             background-color: #ffffff;
-            height: 3px;
+            height: 5px;
             width: 30px;
             left: calc(50% - 15px);
         }
@@ -373,6 +377,7 @@ ROBOT_INTERFACE_HTML = """
             position: absolute;
             top: calc(50% - 20px);
             left: calc(50% - 20px);
+            transition: transform 0.3s ease;
         }
         .move-forward {
             animation: moveForward 2s linear;
@@ -474,6 +479,14 @@ ROBOT_INTERFACE_HTML = """
                 const statusElement = document.getElementById('voiceStatus');
                 statusElement.textContent = status;
                 statusElement.className = status.includes('Listening') ? 'listening' : '';
+                
+                // Update robot face state
+                const robotFace = document.getElementById('robotFace');
+                if (status.includes('Listening for command')) {
+                    robotFace.className = 'active';
+                } else {
+                    robotFace.className = '';
+                }
             }
             
             // Process speech results
@@ -492,7 +505,6 @@ ROBOT_INTERFACE_HTML = """
                         
                         // Visual feedback
                         updateStatus("Listening for command...");
-                        document.getElementById('robotFace').className = 'active';
                         
                         // Start listening for the actual command
                         setTimeout(() => {
@@ -538,7 +550,6 @@ ROBOT_INTERFACE_HTML = """
                 isListeningForCommand = false;
                 isListeningForTrigger = true;
                 recognition.continuous = true;
-                document.getElementById('robotFace').className = '';
                 updateStatus("Listening for trigger word...");
                 
                 // Restart recognition after a short delay
@@ -598,7 +609,6 @@ ROBOT_INTERFACE_HTML = """
                 isListeningForTrigger = false;
                 isListeningForCommand = true;
                 updateStatus("Listening for command...");
-                document.getElementById('robotFace').className = 'active';
                 
                 // Set timeout for command
                 commandTimeout = setTimeout(() => {
@@ -653,7 +663,7 @@ ROBOT_INTERFACE_HTML = """
             });
         });
 
-        // Simple visualization of the command
+        // Improved visualization of the command
         function visualizeCommand(command) {
             const visualizer = document.getElementById('commandVisualizer');
             visualizer.innerHTML = ''; // Clear previous visualization
@@ -667,16 +677,22 @@ ROBOT_INTERFACE_HTML = """
                 const firstCommand = command.commands[0];
                 
                 if (firstCommand.mode === 'linear') {
-                    robot.classList.add('move-' + firstCommand.direction);
-                    robot.style.animationDuration = (firstCommand.time || 2) + 's';
+                    setTimeout(() => {
+                        robot.classList.add('move-' + firstCommand.direction);
+                        robot.style.animationDuration = (firstCommand.time || 2) + 's';
+                    }, 50);
                 } 
                 else if (firstCommand.mode === 'rotate') {
-                    robot.classList.add('rotate-' + firstCommand.direction);
-                    robot.style.animationDuration = (firstCommand.time || 2) + 's';
+                    setTimeout(() => {
+                        robot.classList.add('rotate-' + firstCommand.direction);
+                        robot.style.animationDuration = (firstCommand.time || 2) + 's';
+                    }, 50);
                 }
                 else if (firstCommand.mode === 'arc') {
-                    robot.classList.add('arc-' + firstCommand.direction);
-                    robot.style.animationDuration = (firstCommand.time || 3) + 's';
+                    setTimeout(() => {
+                        robot.classList.add('arc-' + firstCommand.direction);
+                        robot.style.animationDuration = (firstCommand.time || 3) + 's';
+                    }, 50);
                 }
                 else if (firstCommand.mode === 'stop') {
                     robot.classList.add('stop');
@@ -684,16 +700,22 @@ ROBOT_INTERFACE_HTML = """
             } else if (command.mode) {
                 // Handle legacy format
                 if (command.mode === 'linear') {
-                    robot.classList.add('move-' + command.direction);
-                    robot.style.animationDuration = (command.time || 2) + 's';
+                    setTimeout(() => {
+                        robot.classList.add('move-' + command.direction);
+                        robot.style.animationDuration = (command.time || 2) + 's';
+                    }, 50);
                 } 
                 else if (command.mode === 'rotate') {
-                    robot.classList.add('rotate-' + command.direction);
-                    robot.style.animationDuration = (command.time || 2) + 's';
+                    setTimeout(() => {
+                        robot.classList.add('rotate-' + command.direction);
+                        robot.style.animationDuration = (command.time || 2) + 's';
+                    }, 50);
                 }
                 else if (command.mode === 'arc') {
-                    robot.classList.add('arc-' + command.direction);
-                    robot.style.animationDuration = (command.time || 3) + 's';
+                    setTimeout(() => {
+                        robot.classList.add('arc-' + command.direction);
+                        robot.style.animationDuration = (command.time || 3) + 's';
+                    }, 50);
                 }
                 else if (command.mode === 'stop') {
                     robot.classList.add('stop');
@@ -768,7 +790,9 @@ def auth():
         session['user'] = username
         return redirect(url_for('home'))
     else:
-        return LOGIN_HTML.replace("{% if error %}", "").replace("{% endif %}", "").replace("{{ error }}", "Invalid credentials")
+        error_html = LOGIN_HTML.replace('<p class="error" id="errorMsg" style="display: none;"></p>', 
+                                         '<p class="error" id="errorMsg">Invalid credentials</p>')
+        return error_html
 
 @app.route('/logout')
 def logout():
@@ -792,11 +816,14 @@ def send_command():
         if not command:
             return jsonify({"error": "No command provided"})
         
-        # Get user command history
+        # Get user command history for context (only command strings)
         user_commands = []
-        if user in command_history and isinstance(command_history[user], list):
-            user_commands = [entry.get("original_command", "") for entry in command_history[user] 
-                           if isinstance(entry, dict) and "original_command" in entry]
+        if user in command_history:
+            # Extract original commands from command objects
+            user_commands = [
+                item["original_command"] for item in command_history[user] 
+                if isinstance(item, dict) and "original_command" in item
+            ][-3:]  # Just get the last 3 commands for context
         
         # Process the command
         response = interpret_command(command, user_commands)
@@ -805,13 +832,12 @@ def send_command():
         if user not in command_history:
             command_history[user] = []
         
-        # Only store command data in history, not timestamps
-        if isinstance(command_history[user], list):
-            command_history[user].append({
-                "timestamp": time.time(),
-                "original_command": command,
-                "response": response
-            })
+        # Add the new command and response to history
+        command_history[user].append({
+            "timestamp": time.time(),
+            "original_command": command,
+            "response": response
+        })
         
         return jsonify(response)
     except Exception as e:
