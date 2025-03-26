@@ -37,7 +37,7 @@ rate_limit_timestamps = {}
 # Rate limiting configuration
 rate_limits = {
     "admin": {"requests": 50, "period": 3600},  # 50 requests per hour
-    "user": {"requests": 20, "period": 3600}    # 20 requests per hour
+    "user": {"requests": 20, "period": 3600}      # 20 requests per hour
 }
 
 # Decorator for authentication
@@ -88,32 +88,44 @@ def rate_limit(f):
 def interpret_command(command, previous_commands=None):
     """
     Enhanced function to interpret human commands with context from previous commands.
+    This version expects composite commands (like drawing a rectangle) to return an array of command objects.
     """
-    # Define a more detailed system prompt with explicit instructions for complex shapes
-    system_prompt ="""You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
+    # Define a detailed system prompt including an example for a composite command.
+    system_prompt = """You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
+    
+If the command is simple (e.g., "move forward 5 meters"), output a single JSON command object.
+If the command requires multiple steps (e.g., "draw a rectangle"), output a JSON array of command objects where each object represents a distinct movement.
+    
+**Supported movement modes:**
+- "linear": straight-line movement
+- "rotate": turning by a specified angle
+- "arc": smooth curved movement
+- "stop": to halt the robot
 
-**Example of Supported Shapes:**
-- Square (4 straight lines + 4 turns)
-- Triangle (3 straight lines + 3 turns)
-- Circle (smooth curved movement)
-- Pentagon, Hexagon (straight lines + turns)
+**Each command object should include keys such as:**
+- "mode": (e.g., "linear", "rotate")
+- "direction": for linear movements (e.g., "forward", "backward", "left", "right")
+- "speed": in meters per second
+- "distance": in meters (if applicable)
+- "rotation": in degrees (if applicable)
+- "stop_condition": (e.g., "distance", "time")
+- "turn_radius": if applicable
+- "time": duration in seconds if applicable
 
-### JSON Output Format:
-- "mode": Type of movement ("linear", "rotate", "arc", "stop")
-- "direction": Movement direction ("forward", "backward", "left", "right")
-- "speed": Speed in meters per second (m/s)
-- "distance": Distance in meters (if applicable)
-- "time": Duration in seconds (if applicable)
-- "rotation": Rotation angle in degrees (if applicable)
-- "turn_radius": Radius for curved movements (if applicable)
-- "stop_condition": When to stop ("time", "distance", "obstacle")
+**Example for a rectangle:**
+```json
+[
+    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
+    {"mode": "rotate", "rotation": 90},
+    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
+    {"mode": "rotate", "rotation": 90},
+    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
+    {"mode": "rotate", "rotation": 90},
+    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
+    {"mode": "rotate", "rotation": 90}
+]
 
----
 
-### Convert the following user command into JSON format:
-
-User: "{command}"
-AI Output:
 """
 
 
