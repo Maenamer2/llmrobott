@@ -90,39 +90,41 @@ def interpret_command(command, previous_commands=None):
     Enhanced function to interpret human commands with context from previous commands.
     """
     # Define a more detailed system prompt with explicit instructions for complex shapes
-    system_prompt = """You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
+    system_prompt = prompt = f"""
+You are an AI that acts as a movement controller for a 4-wheeled ground robot.
 
-You MUST only output valid JSON. No explanatory text or markdown formatting is allowed.
+You take a user’s natural language instruction and convert it into an **array of structured JSON commands**. The robot understands discrete commands in a step-by-step sequence.
 
-**Supported Movements:**
-- Linear motion (forward, backward) with speed and distance/time
-- Rotation (left, right) with degrees
-- Arc movements with radius
-- Complex shapes (squares, triangles, circles, etc.)
-- Sequential commands (can use all of the above as you see needed)
+###  Supported Movements:
+- Linear (forward/backward)
+- Rotations (left/right in degrees)
+- Arcs (curved paths)
+- Stop
 
-**Complex Shape Implementation Guidelines:**
-- Break down shapes, letters, symbols into structured commands
-- Determine number of sides, arcs, angles needed
-- Define order of implementation to achieve the shape
+###  Output Format (one object per step):
 
-**JSON Output Format:**
-{
-  "commands": [
-    {
-      "mode": "linear|rotate|arc|stop",
-      "direction": "forward|backward|left|right",
-      "speed": float,  // meters per second
-      "distance": float,  // meters (if applicable)
-      "time": float,  // seconds (if applicable)
-      "rotation": float,  // degrees (if applicable)
-      "turn_radius": float,  // meters (if applicable)
-      "stop_condition": "time|distance|obstacle"  // when to stop
-    }
-  ],
-  "shape_description": "String describing the shape or movement"
-}
+- mode: "linear" | "rotate" | "arc" | "stop"
+- direction: "forward" | "backward" | "left" | "right"
+- speed: float (in m/s)
+- distance: float (in meters, if mode is linear)
+- time: float (in seconds, if mode is time-based)
+- rotation: float (in degrees, if mode is rotate)
+- turn_radius: float (in meters, if mode is arc)
+- stop_condition: "distance" | "time" | "obstacle"
+
+###  Behavior Rules:
+- **DO NOT** output explanations.
+- **Only output** a valid JSON array of command objects.
+- **Be consistent** in formatting and numerical values.
+- Handle shapes (square, circle, triangle) using multiple steps.
+
+
+---
+
+User command: "{command}"
+AI Output (JSON array only):
 """
+
 
     # User prompt with context
     user_prompt = f"Convert this command into a structured robot command: \"{command}\""
@@ -431,16 +433,16 @@ ROBOT_INTERFACE_HTML = """
             <div class="command-examples">
                 <h3>Try these commands:</h3>
                 <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Draw a square with 1 meter sides
+                    Do a square with 1.5 meter sides
                 </div>
                 <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Draw a plus sign with 0.5 meter arms
+                    Go left for 3 seconds then go right quickly for 5 meters
                 </div>
                 <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Draw a right triangle with 1 meter sides
+                    Draw a circle with an area of 20 meters
                 </div>
                 <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Draw a question mark
+                    make a star 
                 </div>
             </div>
             
