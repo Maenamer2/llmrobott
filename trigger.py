@@ -1,4 +1,3 @@
-import flask
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import openai
 import json
@@ -17,7 +16,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))  # Secure random secret key
+app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
 
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -31,13 +30,11 @@ USERS = {
 
 # Command history for audit and improved responses
 command_history = {}
-# Add a separate rate limiting timestamps dictionary
-rate_limit_timestamps = {}
 
 # Rate limiting configuration
 rate_limits = {
     "admin": {"requests": 50, "period": 3600},  # 50 requests per hour
-    "user": {"requests": 20, "period": 3600}      # 20 requests per hour
+    "user": {"requests": 20, "period": 3600}    # 20 requests per hour
 }
 
 # Decorator for authentication
@@ -45,11 +42,11 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user' not in session:
-            return redirect(url_for('login'))
+            return jsonify({"error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return decorated_function
 
-# Updated decorator for rate limiting
+# Decorator for rate limiting
 def rate_limit(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -61,26 +58,24 @@ def rate_limit(f):
         role = USERS[user].get('role', 'user')
         limit = rate_limits.get(role, rate_limits['user'])
         
-        # Initialize timestamps for this user if they don't exist
-        if user not in rate_limit_timestamps:
-            rate_limit_timestamps[user] = []
+        # Initialize history if not exists
+        if user not in command_history:
+            command_history[user] = []
         
-        # Clean up old timestamps
+        # Clean up old requests
         current_time = time.time()
-        rate_limit_timestamps[user] = [
-            t for t in rate_limit_timestamps[user] 
-            if current_time - t < limit['period']
-        ]
+        command_history[user] = [t for t in command_history[user] 
+                                 if isinstance(t, float) and current_time - t < limit['period']]
         
         # Check if limit exceeded
-        if len(rate_limit_timestamps[user]) >= limit['requests']:
+        if len(command_history[user]) >= limit['requests']:
             return jsonify({
                 "error": f"Rate limit exceeded. Maximum {limit['requests']} requests per {limit['period']//3600} hour(s).",
-                "retry_after": limit['period'] - (current_time - rate_limit_timestamps[user][0])
+                "retry_after": limit['period'] - (current_time - command_history[user][0])
             }), 429
         
         # Add current request timestamp
-        rate_limit_timestamps[user].append(current_time)
+        command_history[user].append(current_time)
         
         return f(*args, **kwargs)
     return decorated_function
@@ -88,54 +83,59 @@ def rate_limit(f):
 def interpret_command(command, previous_commands=None):
     """
     Enhanced function to interpret human commands with context from previous commands.
-    This version expects composite commands (like drawing a rectangle) to return an array of command objects.
     """
-    # Define a detailed system prompt including an example for a composite command.
-    system_prompt = """You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
-    
-If the command is simple (e.g., "move forward 5 meters"), output a single JSON command object.
-If the command requires multiple steps (e.g., "draw a rectangle"), output a JSON array of command objects where each object represents a distinct movement.
-    
-**Supported movement modes:**
-- "linear": straight-line movement
-- "rotate": turning by a specified angle
-- "arc": smooth curved movement
-- "stop": to halt the robot
+    # Define a more detailed system prompt with improved prompt engineering
+    system_prompt = """You are an AI that converts natural language movement instructions into structured JSON commands for a 4-wheeled robot.
 
-**Each command object should include keys such as:**
-- "mode": (e.g., "linear", "rotate")
-- "direction": for linear movements (e.g., "forward", "backward", "left", "right")
-- "speed": in meters per second
-- "distance": in meters (if applicable)
-- "rotation": in degrees (if applicable)
-- "stop_condition": (e.g., "distance", "time")
-- "turn_radius": if applicable
-- "time": duration in seconds if applicable
+You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
 
-**Example for a rectangle:**
-```json
-[
-    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
-    {"mode": "rotate", "rotation": 90},
-    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
-    {"mode": "rotate", "rotation": 90},
-    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
-    {"mode": "rotate", "rotation": 90},
-    {"mode": "linear", "direction": "forward", "distance": 4, "speed": 1, "stop_condition": "distance"},
-    {"mode": "rotate", "rotation": 90}
-]
+Input: Natural language instructions for robot movement
+Output: JSON object representing the commands
 
+**Supported Movements:**
+- Linear motion: "forward", "backward" with speed (m/s) and either distance (m) or time (s)
+- Rotation: "left", "right" with degrees
+- Arc movements: Curved paths with specified radius and direction
+- Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
+- Sequential movements: Multiple commands in sequence
 
+**Output Format:**
+{
+  "commands": [
+    {
+      "mode": "linear|rotate|arc|stop",
+      "direction": "forward|backward|left|right",
+      "speed": float,  // meters per second (0.1-2.0)
+      "distance": float,  // meters (if applicable)
+      "time": float,  // seconds (if applicable)
+      "rotation": float,  // degrees (if applicable)
+      "turn_radius": float,  // meters (for arc movements)
+      "stop_condition": "time|distance|obstacle"  // when to stop
+    },
+    // Additional commands for sequences
+  ],
+  "sequence_type": "parallel|sequential",
+  "description": "Brief human-readable description of what the robot will do"
+}
+
+For shapes, break them down into appropriate primitive movements:
+- Square: 4 forward movements with 90° right/left turns
+- Circle: A series of short arcs that form a complete 360° path
+- Triangle: 3 forward movements with 120° turns
+- Rectangle: 2 pairs of different-length forward movements with 90° turns
+- Figure-eight: Two connected circles in opposite directions
+
+Always provide complete, valid JSON that a robot can execute immediately.
 """
-
 
     # User prompt with context
     user_prompt = f"Convert this command into a structured robot command: \"{command}\""
     
     # Add context from previous commands if available
     if previous_commands and len(previous_commands) > 0:
+        recent_commands = previous_commands[-3:]  # Last 3 commands
         context = "Previous commands for context:\n" + "\n".join([
-            f"- {cmd}" for cmd in previous_commands[-3:]  # Last 3 commands
+            f"- {cmd}" for cmd in recent_commands
         ])
         user_prompt = context + "\n\n" + user_prompt
 
@@ -146,7 +146,7 @@ If the command requires multiple steps (e.g., "draw a rectangle"), output a JSON
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.45,
+            temperature=0.3,  # Lower temperature for more consistent outputs
             response_format={"type": "json_object"}  # Ensure JSON response
         )
 
@@ -160,11 +160,18 @@ If the command requires multiple steps (e.g., "draw a rectangle"), output a JSON
             parsed_data["timestamp"] = time.time()
             parsed_data["original_command"] = command
             
+            # Validate the JSON structure
+            if "commands" not in parsed_data:
+                parsed_data["commands"] = [{
+                    "mode": "stop",
+                    "description": "Invalid command structure - missing commands array"
+                }]
+            
             return parsed_data
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {e}, raw output: {raw_output}")
             
-            # Try to extract JSON from the response using regex
+            # Try to extract JSON from the response using regex - useful for debugging
             json_match = re.search(r'```json(.*?)```', raw_output, re.DOTALL)
             if json_match:
                 try:
@@ -173,18 +180,31 @@ If the command requires multiple steps (e.g., "draw a rectangle"), output a JSON
                 except:
                     pass
             
+            # Fallback response if parsing fails
             return {
                 "error": "Failed to parse response as JSON",
                 "commands": [{
                     "mode": "stop",
                     "description": "Command parsing error - robot stopped"
-                }]
+                }],
+                "sequence_type": "sequential",
+                "description": "Error in command processing"
             }
 
     except Exception as e:
         logger.error(f"API error: {str(e)}")
-        return {"error": str(e)}
+        return {
+            "error": str(e),
+            "commands": [{
+                "mode": "stop",
+                "description": "API error - robot stopped"
+            }],
+            "sequence_type": "sequential",
+            "description": "Error in API communication"
+        }
 
+
+   
 # HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
