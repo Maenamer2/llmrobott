@@ -85,79 +85,40 @@ def rate_limit(f):
         return f(*args, **kwargs)
     return decorated_function
 
-def validate_command_structure(parsed_data):
-    """
-    Validate the structure of the interpreted command to ensure safety and correctness.
-    """
-    # Define valid modes and their required fields
-    mode_requirements = {
-        "linear": ["direction", "speed", "distance"],
-        "rotate": ["direction", "rotation"],
-        "arc": ["direction", "turn_radius", "distance"],
-        "stop": []
-    }
-    
-    # Check if mode is valid
-    if "mode" not in parsed_data or parsed_data["mode"] not in mode_requirements:
-        return False, "Invalid movement mode"
-    
-    # Check required fields for each mode
-    mode = parsed_data["mode"]
-    for req_field in mode_requirements[mode]:
-        if req_field not in parsed_data:
-            return False, f"Missing required field {req_field} for {mode} mode"
-    
-    # Additional safety checks
-    if "speed" in parsed_data:
-        if not isinstance(parsed_data["speed"], (int, float)) or parsed_data["speed"] < 0 or parsed_data["speed"] > 5:
-            return False, "Speed must be a number between 0 and 5 m/s"
-    
-    if "distance" in parsed_data:
-        if not isinstance(parsed_data["distance"], (int, float)) or parsed_data["distance"] < 0 or parsed_data["distance"] > 50:
-            return False, "Distance must be a number between 0 and 50 meters"
-    
-    if "rotation" in parsed_data:
-        if not isinstance(parsed_data["rotation"], (int, float)) or abs(parsed_data["rotation"]) > 360:
-            return False, "Rotation must be a number between -360 and 360 degrees"
-    
-    return True, "Valid command"
-
 def interpret_command(command, previous_commands=None):
     """
     Enhanced function to interpret human commands with context from previous commands.
-    Includes more robust error handling and validation.
     """
-    # Define a more detailed and constrained system prompt
-    system_prompt = """You are an AI that converts human movement instructions into precise, safe, and structured JSON commands for a 4-wheeled robot.
+    # Define a more detailed system prompt with explicit instructions for complex shapes
+    system_prompt ="""You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
 
-Rules:
-1. Always use standard SI units (meters, m/s)
-2. Speed range: 0-5 m/s
-3. Distance range: 0-50 meters
-4. Rotation: -360 to 360 degrees
-5. Prioritize safety and realistic robot movements
+**Example of Supported Shapes:**
+- Square (4 straight lines + 4 turns)
+- Triangle (3 straight lines + 3 turns)
+- Circle (smooth curved movement)
+- Pentagon, Hexagon (straight lines + turns)
 
-Movement Modes:
-- linear: Straight line movement
-- rotate: In-place rotation
-- arc: Curved movement
-- stop: Halt all movement
+### JSON Output Format:
+- "mode": Type of movement ("linear", "rotate", "arc", "stop")
+- "direction": Movement direction ("forward", "backward", "left", "right")
+- "speed": Speed in meters per second (m/s)
+- "distance": Distance in meters (if applicable)
+- "time": Duration in seconds (if applicable)
+- "rotation": Rotation angle in degrees (if applicable)
+- "turn_radius": Radius for curved movements (if applicable)
+- "stop_condition": When to stop ("time", "distance", "obstacle")
 
-JSON Output Format:
-{
-  "mode": "linear/rotate/arc/stop",
-  "direction": "forward/backward/left/right",
-  "speed": 0-5 (m/s),
-  "distance": 0-50 (meters),
-  "rotation": -360 to 360 (degrees),
-  "turn_radius": Optional (for arc movements)
-}
+---
 
-Interpret the following command carefully, focusing on precision and safety:
+### Convert the following user command into JSON format:
+
+User: "{command}"
+AI Output:
 """
 
-    # Prepare user prompt with context
-    user_prompt = f"Convert this command precisely into a robot command: \"{command}\""
+
+    # User prompt with context
+    user_prompt = f"Convert this command into a structured robot command: \"{command}\""
     
     # Add context from previous commands if available
     if previous_commands and len(previous_commands) > 0:
@@ -167,14 +128,13 @@ Interpret the following command carefully, focusing on precision and safety:
         user_prompt = context + "\n\n" + user_prompt
 
     try:
-        # Use a more constrained temperature and specify JSON response
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,  # Lower temperature for more consistent outputs
+            temperature=0.45,
             response_format={"type": "json_object"}  # Ensure JSON response
         )
 
@@ -182,45 +142,36 @@ Interpret the following command carefully, focusing on precision and safety:
         logger.info(f"Raw LLM output: {raw_output}")
 
         try:
-            # Carefully parse JSON, ensuring all keys are lowercase
             parsed_data = json.loads(raw_output)
-            
-            # Validate the parsed command
-            is_valid, validation_message = validate_command_structure(parsed_data)
-            
-            if not is_valid:
-                logger.warning(f"Command validation failed: {validation_message}")
-                return {
-                    "error": validation_message,
-                    "mode": "stop",
-                    "description": "Invalid command - robot stopped for safety"
-                }
             
             # Add metadata
             parsed_data["timestamp"] = time.time()
             parsed_data["original_command"] = command
-            parsed_data["validation_status"] = "passed"
             
             return parsed_data
-        
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {e}, raw output: {raw_output}")
             
+            # Try to extract JSON from the response using regex
+            json_match = re.search(r'```json(.*?)```', raw_output, re.DOTALL)
+            if json_match:
+                try:
+                    json_str = json_match.group(1).strip()
+                    return json.loads(json_str)
+                except:
+                    pass
+            
             return {
                 "error": "Failed to parse response as JSON",
-                "mode": "stop",
-                "description": "Command parsing error - robot stopped"
+                "commands": [{
+                    "mode": "stop",
+                    "description": "Command parsing error - robot stopped"
+                }]
             }
 
     except Exception as e:
         logger.error(f"API error: {str(e)}")
-        return {
-            "error": str(e),
-            "mode": "stop",
-            "description": "Unexpected error - robot stopped"
-        }
-
-
+        return {"error": str(e)}
 
 # HTML Templates
 LOGIN_HTML = """
