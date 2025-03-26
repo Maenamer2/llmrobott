@@ -1,3 +1,4 @@
+import flask
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import openai
 import json
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
+app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))  # Secure random secret key
 
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -98,13 +99,12 @@ You MUST only output valid JSON. No explanatory text or markdown formatting is a
 - Rotation (left, right) with degrees
 - Arc movements with radius
 - Complex shapes (squares, triangles, circles, etc.)
-- Sequential commands (all of the above as you see needed)
+- Sequential commands (can use all of the above as you see needed)
 
 **Complex Shape Implementation Guidelines:**
-
-hint: you can break down shapes,letters,symbols into order structred commands:
-how many sides,arcs,angles needed.
-then their order of implementation to acheive the shape.
+- Break down shapes, letters, symbols into structured commands
+- Determine number of sides, arcs, angles needed
+- Define order of implementation to achieve the shape
 
 **JSON Output Format:**
 {
@@ -118,12 +118,10 @@ then their order of implementation to acheive the shape.
       "rotation": float,  // degrees (if applicable)
       "turn_radius": float,  // meters (if applicable)
       "stop_condition": "time|distance|obstacle"  // when to stop
-    },
-    // Additional commands for sequences
-  
+    }
+  ],
+  "shape_description": "String describing the shape or movement"
 }
-
-For ANY complex shape, break it down into appropriate primitives. Be precise and detailed in shape creation.
 """
 
     # User prompt with context
@@ -143,7 +141,7 @@ For ANY complex shape, break it down into appropriate primitives. Be precise and
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,
+            temperature=0.45,
             response_format={"type": "json_object"}  # Ensure JSON response
         )
 
@@ -182,7 +180,7 @@ For ANY complex shape, break it down into appropriate primitives. Be precise and
         logger.error(f"API error: {str(e)}")
         return {"error": str(e)}
 
-# HTML Templates as strings for single-file deployment
+# HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -365,18 +363,13 @@ ROBOT_INTERFACE_HTML = """
             border-radius: 10px;
             transition: all 0.5s ease;
         }
-        #robotFace.active .mouth {
+        #robotFace.active .mouth,
+        #robotFace.listening .mouth {
             background-color: #ffffff;
             height: 15px;
             width: 40px;
             left: calc(50% - 20px);
             border-radius: 0 0 20px 20px;
-        }
-        #robotFace.listening .mouth {
-            background-color: #ffffff;
-            height: 5px;
-            width: 30px;
-            left: calc(50% - 15px);
         }
         a.logout { 
             display: inline-block; 
@@ -410,215 +403,6 @@ ROBOT_INTERFACE_HTML = """
             background-color: #475569;
         }
     </style>
-    <script>
-        function initSpeechRecognition() {
-            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-                alert("Speech recognition not supported in this browser. Try Chrome, Edge, or Safari.");
-                return;
-            }
-
-            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-            const triggerPhrases = ["hey robot", "okay robot", "robot", "hey bot"];
-            
-            let recognition = new SpeechRecognition();
-            let isListeningForTrigger = false;
-            let isListeningForCommand = false;
-            let commandTimeout = null;
-            
-            // Configure recognition
-            recognition.continuous = true;
-            recognition.interimResults = true;
-            recognition.lang = 'en-US';
-            
-            // Update UI to show status
-            function updateStatus(status) {
-                const statusElement = document.getElementById('voiceStatus');
-                statusElement.textContent = status;
-                statusElement.className = status.includes('Listening') ? 'listening' : '';
-                
-                // Update robot face state
-                const robotFace = document.getElementById('robotFace');
-                if (status.includes('Listening for command')) {
-                    robotFace.className = 'listening';
-                } else if (status.includes('Processing command')) {
-                    robotFace.className = 'active';
-                } else {
-                    robotFace.className = '';
-                }
-            }
-            
-            // Process speech results
-            recognition.onresult = function(event) {
-                const lastResult = event.results[event.results.length - 1];
-                const transcript = lastResult[0].transcript.trim().toLowerCase();
-                
-                // For debugging
-                console.log(`🎤 Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
-                
-                if (isListeningForTrigger) {
-                    // Check for trigger phrases
-                    if (triggerPhrases.some(phrase => transcript.includes(phrase))) {
-                        console.log("✅ Trigger phrase detected");
-                        recognition.stop(); // Stop current session
-                        
-                        // Visual feedback
-                        updateStatus("Listening for command...");
-                        
-                        // Start listening for the actual command
-                        setTimeout(() => {
-                            isListeningForTrigger = false;
-                            isListeningForCommand = true;
-                            recognition.continuous = false; // Only get one command
-                            recognition.start();
-                            
-                            // Set a 5-second timeout for command
-                            commandTimeout = setTimeout(() => {
-                                if (isListeningForCommand) {
-                                    recognition.stop();
-                                    resetToTriggerMode();
-                                    updateStatus("No command heard. Try again.");
-                                }
-                            }, 5000);
-                        }, 300);
-                    }
-                } 
-                else if (isListeningForCommand && !lastResult.isFinal) {
-                    // Show intermediate results
-                    document.getElementById('command').value = transcript;
-                }
-                else if (isListeningForCommand && lastResult.isFinal) {
-                    // Final command received
-                    clearTimeout(commandTimeout);
-                    document.getElementById('command').value = transcript;
-                    console.log("🎙️ Command received:", transcript);
-                    
-                    // Visual feedback
-                    updateStatus("Processing command...");
-                    
-                    // Submit the form
-                    document.getElementById('commandForm').requestSubmit();
-                    
-                    // Reset to trigger mode
-                    resetToTriggerMode();
-                }
-            };
-            
-            // Reset to initial trigger word listening mode
-            function resetToTriggerMode() {
-                isListeningForCommand = false;
-                isListeningForTrigger = true;
-                recognition.continuous = true;
-                updateStatus("Listening for trigger word...");
-                
-                // Restart recognition after a short delay
-                setTimeout(() => {
-                    try {
-                        recognition.start();
-                    } catch (e) {
-                        console.log("Recognition already started, restarting...");
-                        recognition.stop();
-                        setTimeout(() => recognition.start(), 200);
-                    }
-                }, 300);
-            }
-            
-            // Handle errors
-            recognition.onerror = function(event) {
-                console.log("⚠️ Speech recognition error:", event.error);
-                if (event.error === 'no-speech') {
-                    // No speech detected, just restart
-                    recognition.stop();
-                    resetToTriggerMode();
-                } else {
-                    // For other errors, wait a bit longer before restarting
-                    updateStatus("Voice recognition error. Restarting...");
-                    setTimeout(resetToTriggerMode, 2000);
-                }
-            };
-            
-            // Handle end of recognition
-            recognition.onend = function() {
-                if (isListeningForTrigger) {
-                    // If we're supposed to be listening for the trigger but recognition ended,
-                    // restart it after a short delay
-                    setTimeout(() => {
-                        try {
-                            recognition.start();
-                        } catch (e) {
-                            console.log("Recognition already started");
-                        }
-                    }, 200);
-                }
-            };
-            
-            // Initial start
-            updateStatus("Listening for trigger word...");
-            try {
-                recognition.start();
-                isListeningForTrigger = true;
-            } catch (e) {
-                console.error("Failed to start speech recognition:", e);
-                updateStatus("Failed to start voice recognition");
-            }
-            
-            // Expose functions
-            window.manualStartListening = function() {
-                recognition.stop();
-                isListeningForTrigger = false;
-                isListeningForCommand = true;
-                updateStatus("Listening for command...");
-                
-                // Set timeout for command (5 seconds)
-                commandTimeout = setTimeout(() => {
-                    if (isListeningForCommand) {
-                        recognition.stop();
-                        resetToTriggerMode();
-                        updateStatus("No command heard. Try again.");
-                    }
-                }, 5000);
-                
-                setTimeout(() => {
-                    recognition.continuous = false;
-                    recognition.start();
-                }, 200);
-            };
-        }
-
-        // Initialize when the page loads
-        document.addEventListener('DOMContentLoaded', function() {
-            initSpeechRecognition();
-            
-            // Handle form submission with improved error handling
-            document.getElementById('commandForm').addEventListener('submit', function(event) {
-                event.preventDefault();
-                let formData = new FormData(this);
-                
-                // Update UI
-                document.getElementById('responseStatus').textContent = "Processing...";
-                
-                fetch('/send_command', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => {
-                    // Check if the response is OK before attempting to parse JSON
-                    if (!response.ok) {
-                        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    const output = JSON.stringify(data, null, 4);
-                    document.getElementById('response').textContent = output;
-                    document.getElementById('responseStatus').textContent = "Command received";
-                })
-                .catch(error => {
-                    document.getElementById('response').textContent = "⚠️ Error: " + error.message;
-                    document.getElementById('responseStatus').textContent = "Error";
-                });
-            });
-        });
-    </script>
 </head>
 <body>
     <div class="container">
@@ -639,7 +423,7 @@ ROBOT_INTERFACE_HTML = """
             <form id="commandForm" method="POST" action="/send_command">
                 <input type="text" id="command" name="command" placeholder="Enter movement command or say 'Hey Robot'..." required>
                 <div>
-                    <button type="button" class="btn-speak" onclick="window.manualStartListening()">🎤 Speak</button>
+                    <button type="button" class="btn-speak" onclick="manualStartListening()">🎤 Speak</button>
                     <button type="submit">Send Command</button>
                 </div>
             </form>
@@ -666,6 +450,195 @@ ROBOT_INTERFACE_HTML = """
             <a class="logout" href="/logout">🚪 Logout</a>
         </div>
     </div>
+
+    <script>
+    // Speech Recognition Setup
+    let recognition = null;
+    const triggerPhrases = ["hey robot", "okay robot", "robot", "hey bot"];
+    let isListeningForTrigger = false;
+    let isListeningForCommand = false;
+    let commandTimeout = null;
+
+    function initSpeechRecognition() {
+        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+            alert("Speech recognition not supported. Try Chrome, Edge, or Safari.");
+            return;
+        }
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        
+        // Configure recognition
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+        
+        // Update UI to show status
+        function updateStatus(status) {
+            const statusElement = document.getElementById('voiceStatus');
+            const robotFace = document.getElementById('robotFace');
+            
+            statusElement.textContent = status;
+            statusElement.className = status.includes('Listening') ? 'listening' : '';
+            
+            if (status.includes('Listening for trigger')) {
+                robotFace.className = '';
+            } else if (status.includes('Listening for command')) {
+                robotFace.className = 'listening';
+            } else if (status.includes('Processing')) {
+                robotFace.className = 'active';
+            }
+        }
+        
+        // Process speech results
+        recognition.onresult = function(event) {
+            const lastResult = event.results[event.results.length - 1];
+            const transcript = lastResult[0].transcript.trim().toLowerCase();
+            
+            console.log(`🎤 Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
+            
+            if (isListeningForTrigger) {
+                // Check for trigger phrases
+                if (triggerPhrases.some(phrase => transcript.includes(phrase))) {
+                    recognition.stop();
+                    updateStatus("Listening for command...");
+                    
+                    setTimeout(() => {
+                        isListeningForTrigger = false;
+                        isListeningForCommand = true;
+                        recognition.continuous = false;
+                        recognition.start();
+                        
+                        commandTimeout = setTimeout(() => {
+                            if (isListeningForCommand) {
+                                recognition.stop();
+                                resetToTriggerMode();
+                                updateStatus("No command heard. Try again.");
+                            }
+                        }, 5000);
+                    }, 300);
+                }
+            } 
+            else if (isListeningForCommand && !lastResult.isFinal) {
+                document.getElementById('command').value = transcript;
+            }
+            else if (isListeningForCommand && lastResult.isFinal) {
+                clearTimeout(commandTimeout);
+                document.getElementById('command').value = transcript;
+                
+                updateStatus("Processing command...");
+                document.getElementById('commandForm').requestSubmit();
+                resetToTriggerMode();
+            }
+        };
+        
+        // Reset to trigger word listening mode
+        function resetToTriggerMode() {
+            isListeningForCommand = false;
+            isListeningForTrigger = true;
+            recognition.continuous = true;
+            updateStatus("Listening for trigger word...");
+            
+            setTimeout(() => {
+                try {
+                    recognition.start();
+                } catch (e) {
+                    console.log("Recognition restart error:", e);
+                }
+            }, 300);
+        }
+        
+        // Handle errors
+        recognition.onerror = function(event) {
+            console.log("⚠️ Speech recognition error:", event.error);
+            if (event.error === 'no-speech' || event.error === 'network') {
+                recognition.stop();
+                resetToTriggerMode();
+            } else {
+                updateStatus("Voice recognition error. Restarting...");
+                setTimeout(resetToTriggerMode, 2000);
+            }
+        };
+        
+        // Handle end of recognition
+        recognition.onend = function() {
+            if (isListeningForTrigger) {
+                setTimeout(() => {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        console.log("Recognition start error:", e);
+                    }
+                }, 200);
+            }
+        };
+        
+        // Initial start
+        updateStatus("Listening for trigger word...");
+        try {
+            recognition.start();
+            isListeningForTrigger = true;
+        } catch (e) {
+            console.error("Failed to start speech recognition:", e);
+            updateStatus("Failed to start voice recognition");
+        }
+    }
+
+    function manualStartListening() {
+        if (!recognition) return;
+        
+        recognition.stop();
+        isListeningForTrigger = false;
+        isListeningForCommand = true;
+        document.getElementById('voiceStatus').textContent = "Listening for command...";
+        document.getElementById('robotFace').className = 'listening';
+        
+        commandTimeout = setTimeout(() => {
+            if (isListeningForCommand) {
+                recognition.stop();
+                resetToTriggerMode();
+                document.getElementById('voiceStatus').textContent = "No command heard. Try again.";
+            }
+        }, 5000);
+        
+        setTimeout(() => {
+            recognition.continuous = false;
+            recognition.start();
+        }, 200);
+    }
+
+    // Initialize speech recognition and form submission
+    document.addEventListener('DOMContentLoaded', function() {
+        initSpeechRecognition();
+        
+        document.getElementById('commandForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            let formData = new FormData(this);
+            
+            document.getElementById('responseStatus').textContent = "Processing...";
+            
+            fetch('/send_command', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                const output = JSON.stringify(data, null, 4);
+                document.getElementById('response').textContent = output;
+                document.getElementById('responseStatus').textContent = "Command received";
+            })
+            .catch(error => {
+                document.getElementById('response').textContent = "⚠️ Error: " + error.message;
+                document.getElementById('responseStatus').textContent = "Error";
+            });
+        });
+    });
+    </script>
 </body>
 </html>
 """
@@ -740,4 +713,5 @@ def send_command():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # For development, otherwise use production WSGI server
+    app.run(debug=True, host='0.0.0.0', port=5000)
