@@ -88,7 +88,7 @@ def interpret_command(command, previous_commands=None):
     """
     Enhanced function to interpret human commands with context from previous commands.
     """
-    # Define a more detailed system prompt
+    # Define a more detailed system prompt with explicit instructions for complex shapes
     system_prompt = """You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
 
 You MUST only output valid JSON. No explanatory text or markdown formatting is allowed.
@@ -99,6 +99,27 @@ You MUST only output valid JSON. No explanatory text or markdown formatting is a
 - Arc movements with radius
 - Complex shapes (squares, triangles, circles, etc.)
 - Sequential commands
+
+**Complex Shape Implementation Guidelines:**
+- Plus Sign: 
+  * Start at center point
+  * Move up 0.5m
+  * Return to center
+  * Move right 0.5m
+  * Return to center
+  * Move down 0.5m
+  * Return to center
+  * Move left 0.5m
+  * Return to center
+- Right Triangle: 
+  * Move forward 1m 
+  * Rotate right 90 degrees
+  * Move 1m diagonally to create right triangle
+  * Return to starting point
+- Question Mark: 
+  * Create curved top (arc movement)
+  * Move downward for the curve
+  * Create small dot at bottom
 
 **JSON Output Format:**
 {
@@ -119,7 +140,7 @@ You MUST only output valid JSON. No explanatory text or markdown formatting is a
   "description": "Human-readable description of what the robot will do"
 }
 
-For complex shapes, break them down into a sequence of linear/rotation commands.
+For ANY complex shape, break it down into appropriate primitives. Be precise and detailed in shape creation.
 """
 
     # User prompt with context
@@ -322,6 +343,10 @@ ROBOT_INTERFACE_HTML = """
             background-color: #0ea5e9;
             box-shadow: 0 0 20px rgba(14, 165, 233, 0.7);
         }
+        #robotFace.listening {
+            background-color: #10b981;
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.7);
+        }
         #robotFace::before,
         #robotFace::after {
             content: '';
@@ -340,7 +365,9 @@ ROBOT_INTERFACE_HTML = """
             right: 25px;
         }
         #robotFace.active::before,
-        #robotFace.active::after {
+        #robotFace.active::after,
+        #robotFace.listening::before,
+        #robotFace.listening::after {
             background-color: #ffffff;
             width: 22px;
             height: 22px;
@@ -357,69 +384,16 @@ ROBOT_INTERFACE_HTML = """
         }
         #robotFace.active .mouth {
             background-color: #ffffff;
+            height: 15px;
+            width: 40px;
+            left: calc(50% - 20px);
+            border-radius: 0 0 20px 20px;
+        }
+        #robotFace.listening .mouth {
+            background-color: #ffffff;
             height: 5px;
             width: 30px;
             left: calc(50% - 15px);
-        }
-        #commandVisualizer {
-            height: 150px;
-            background-color: #1e293b;
-            border-radius: 10px;
-            position: relative;
-            overflow: hidden;
-            margin-top: 20px;
-        }
-        .robot {
-            width: 40px;
-            height: 40px;
-            background-color: #0ea5e9;
-            border-radius: 8px;
-            position: absolute;
-            top: calc(50% - 20px);
-            left: calc(50% - 20px);
-            transition: transform 0.3s ease;
-        }
-        .move-forward {
-            animation: moveForward 2s linear;
-        }
-        .move-backward {
-            animation: moveBackward 2s linear;
-        }
-        .rotate-left {
-            animation: rotateLeft 2s linear;
-        }
-        .rotate-right {
-            animation: rotateRight 2s linear;
-        }
-        .arc-left {
-            animation: arcLeft 3s linear;
-        }
-        .arc-right {
-            animation: arcRight 3s linear;
-        }
-        @keyframes moveForward {
-            from { transform: translateY(0); }
-            to { transform: translateY(-60px); }
-        }
-        @keyframes moveBackward {
-            from { transform: translateY(0); }
-            to { transform: translateY(60px); }
-        }
-        @keyframes rotateLeft {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(-360deg); }
-        }
-        @keyframes rotateRight {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-        }
-        @keyframes arcLeft {
-            0% { transform: translate(0, 0) rotate(0deg); }
-            100% { transform: translate(-60px, 0) rotate(-180deg); }
-        }
-        @keyframes arcRight {
-            0% { transform: translate(0, 0) rotate(0deg); }
-            100% { transform: translate(60px, 0) rotate(180deg); }
         }
         a.logout { 
             display: inline-block; 
@@ -454,7 +428,6 @@ ROBOT_INTERFACE_HTML = """
         }
     </style>
     <script>
-        // Improved Voice Recognition
         function initSpeechRecognition() {
             if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
                 alert("Speech recognition not supported in this browser. Try Chrome, Edge, or Safari.");
@@ -483,6 +456,8 @@ ROBOT_INTERFACE_HTML = """
                 // Update robot face state
                 const robotFace = document.getElementById('robotFace');
                 if (status.includes('Listening for command')) {
+                    robotFace.className = 'listening';
+                } else if (status.includes('Processing command')) {
                     robotFace.className = 'active';
                 } else {
                     robotFace.className = '';
@@ -513,12 +488,12 @@ ROBOT_INTERFACE_HTML = """
                             recognition.continuous = false; // Only get one command
                             recognition.start();
                             
-                            // Set timeout for command (5 seconds)
+                            // Set a 5-second timeout for command
                             commandTimeout = setTimeout(() => {
                                 if (isListeningForCommand) {
                                     recognition.stop();
                                     resetToTriggerMode();
-                                    updateStatus("Command timeout. Try again.");
+                                    updateStatus("No command heard. Try again.");
                                 }
                             }, 5000);
                         }, 300);
@@ -610,13 +585,14 @@ ROBOT_INTERFACE_HTML = """
                 isListeningForCommand = true;
                 updateStatus("Listening for command...");
                 
-                // Set timeout for command
+                // Set timeout for command (5 seconds)
                 commandTimeout = setTimeout(() => {
                     if (isListeningForCommand) {
                         recognition.stop();
                         resetToTriggerMode();
+                        updateStatus("No command heard. Try again.");
                     }
-                }, 7000);
+                }, 5000);
                 
                 setTimeout(() => {
                     recognition.continuous = false;
@@ -652,9 +628,6 @@ ROBOT_INTERFACE_HTML = """
                     const output = JSON.stringify(data, null, 4);
                     document.getElementById('response').textContent = output;
                     document.getElementById('responseStatus').textContent = "Command received";
-                    
-                    // Visualize the command (simple animation based on command type)
-                    visualizeCommand(data);
                 })
                 .catch(error => {
                     document.getElementById('response').textContent = "⚠️ Error: " + error.message;
@@ -662,66 +635,6 @@ ROBOT_INTERFACE_HTML = """
                 });
             });
         });
-
-        // Improved visualization of the command
-        function visualizeCommand(command) {
-            const visualizer = document.getElementById('commandVisualizer');
-            visualizer.innerHTML = ''; // Clear previous visualization
-            
-            const robot = document.createElement('div');
-            robot.className = 'robot';
-            visualizer.appendChild(robot);
-            
-            // Different animations based on command type
-            if (command.commands && command.commands.length > 0) {
-                const firstCommand = command.commands[0];
-                
-                if (firstCommand.mode === 'linear') {
-                    setTimeout(() => {
-                        robot.classList.add('move-' + firstCommand.direction);
-                        robot.style.animationDuration = (firstCommand.time || 2) + 's';
-                    }, 50);
-                } 
-                else if (firstCommand.mode === 'rotate') {
-                    setTimeout(() => {
-                        robot.classList.add('rotate-' + firstCommand.direction);
-                        robot.style.animationDuration = (firstCommand.time || 2) + 's';
-                    }, 50);
-                }
-                else if (firstCommand.mode === 'arc') {
-                    setTimeout(() => {
-                        robot.classList.add('arc-' + firstCommand.direction);
-                        robot.style.animationDuration = (firstCommand.time || 3) + 's';
-                    }, 50);
-                }
-                else if (firstCommand.mode === 'stop') {
-                    robot.classList.add('stop');
-                }
-            } else if (command.mode) {
-                // Handle legacy format
-                if (command.mode === 'linear') {
-                    setTimeout(() => {
-                        robot.classList.add('move-' + command.direction);
-                        robot.style.animationDuration = (command.time || 2) + 's';
-                    }, 50);
-                } 
-                else if (command.mode === 'rotate') {
-                    setTimeout(() => {
-                        robot.classList.add('rotate-' + command.direction);
-                        robot.style.animationDuration = (command.time || 2) + 's';
-                    }, 50);
-                }
-                else if (command.mode === 'arc') {
-                    setTimeout(() => {
-                        robot.classList.add('arc-' + command.direction);
-                        robot.style.animationDuration = (command.time || 3) + 's';
-                    }, 50);
-                }
-                else if (command.mode === 'stop') {
-                    robot.classList.add('stop');
-                }
-            }
-        }
     </script>
 </head>
 <body>
@@ -754,15 +667,15 @@ ROBOT_INTERFACE_HTML = """
                     Draw a square with 1 meter sides
                 </div>
                 <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Move forward for 2 seconds at 0.5 meters per second
+                    Draw a plus sign with 0.5 meter arms
                 </div>
                 <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Turn right 90 degrees then move forward 1 meter
+                    Draw a right triangle with 1 meter sides
+                </div>
+                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
+                    Draw a question mark
                 </div>
             </div>
-            
-            <h2>🧠 Command Visualization:</h2>
-            <div id="commandVisualizer"></div>
             
             <h2>🔍 Generated Robot Commands: <span id="responseStatus"></span></h2>
             <pre id="response">No command sent yet.</pre>
@@ -774,7 +687,6 @@ ROBOT_INTERFACE_HTML = """
 </html>
 """
 
-# Route handlers
 @app.route('/')
 def login():
     if 'user' in session:
@@ -823,29 +735,26 @@ def send_command():
             user_commands = [
                 item["original_command"] for item in command_history[user] 
                 if isinstance(item, dict) and "original_command" in item
-            ][-3:]  # Just get the last 3 commands for context
+            ]
         
-        # Process the command
-        response = interpret_command(command, user_commands)
+        # Interpret the command
+        interpreted_command = interpret_command(command, user_commands)
         
         # Store command in history
         if user not in command_history:
             command_history[user] = []
+        command_history[user].append(interpreted_command)
         
-        # Add the new command and response to history
-        command_history[user].append({
-            "timestamp": time.time(),
-            "original_command": command,
-            "response": response
-        })
+        # Limit command history to last 10 commands
+        if len(command_history[user]) > 10:
+            command_history[user] = command_history[user][-10:]
         
-        return jsonify(response)
+        # Return the interpreted command
+        return jsonify(interpreted_command)
+    
     except Exception as e:
-        # Log the error but return it as JSON, not as an HTML error page
         logger.error(f"Error processing command: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # Configure host and port for Render deployment
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)  # Use debug=False for production
+    app.run(debug=True)
