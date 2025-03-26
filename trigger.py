@@ -98,28 +98,13 @@ You MUST only output valid JSON. No explanatory text or markdown formatting is a
 - Rotation (left, right) with degrees
 - Arc movements with radius
 - Complex shapes (squares, triangles, circles, etc.)
-- Sequential commands
+- Sequential commands (all of the above as you see needed)
 
 **Complex Shape Implementation Guidelines:**
-- Plus Sign: 
-  * Start at center point
-  * Move up 0.5m
-  * Return to center
-  * Move right 0.5m
-  * Return to center
-  * Move down 0.5m
-  * Return to center
-  * Move left 0.5m
-  * Return to center
-- Right Triangle: 
-  * Move forward 1m 
-  * Rotate right 90 degrees
-  * Move 1m diagonally to create right triangle
-  * Return to starting point
-- Question Mark: 
-  * Create curved top (arc movement)
-  * Move downward for the curve
-  * Create small dot at bottom
+
+hint: you can break down shapes,letters,symbols into order structred commands:
+how many sides,arcs,angles needed.
+then their order of implementation to acheive the shape.
 
 **JSON Output Format:**
 {
@@ -135,9 +120,7 @@ You MUST only output valid JSON. No explanatory text or markdown formatting is a
       "stop_condition": "time|distance|obstacle"  // when to stop
     },
     // Additional commands for sequences
-  ],
-  "sequence_type": "parallel|sequential",
-  "description": "Human-readable description of what the robot will do"
+  
 }
 
 For ANY complex shape, break it down into appropriate primitives. Be precise and detailed in shape creation.
