@@ -90,39 +90,30 @@ def interpret_command(command, previous_commands=None):
     Enhanced function to interpret human commands with context from previous commands.
     """
     # Define a more detailed system prompt with explicit instructions for complex shapes
-    system_prompt = prompt = f"""
-You are an AI that acts as a movement controller for a 4-wheeled ground robot.
+    system_prompt ="""You are an AI that converts human movement instructions into structured JSON commands for a 4-wheeled robot.
 
-You take a user’s natural language instruction and convert it into an **array of structured JSON commands**. The robot understands discrete commands in a step-by-step sequence.
+**Example of Supported Shapes:**
+- Square (4 straight lines + 4 turns)
+- Triangle (3 straight lines + 3 turns)
+- Circle (smooth curved movement)
+- Pentagon, Hexagon (straight lines + turns)
 
-###  Supported Movements:
-- Linear (forward/backward)
-- Rotations (left/right in degrees)
-- Arcs (curved paths)
-- Stop
-
-###  Output Format (one object per step):
-
-- mode: "linear" | "rotate" | "arc" | "stop"
-- direction: "forward" | "backward" | "left" | "right"
-- speed: float (in m/s)
-- distance: float (in meters, if mode is linear)
-- time: float (in seconds, if mode is time-based)
-- rotation: float (in degrees, if mode is rotate)
-- turn_radius: float (in meters, if mode is arc)
-- stop_condition: "distance" | "time" | "obstacle"
-
-###  Behavior Rules:
-- **DO NOT** output explanations.
-- **Only output** a valid JSON array of command objects.
-- **Be consistent** in formatting and numerical values.
-- Handle shapes (square, circle, triangle) using multiple steps.
-
+### JSON Output Format:
+- "mode": Type of movement ("linear", "rotate", "arc", "stop")
+- "direction": Movement direction ("forward", "backward", "left", "right")
+- "speed": Speed in meters per second (m/s)
+- "distance": Distance in meters (if applicable)
+- "time": Duration in seconds (if applicable)
+- "rotation": Rotation angle in degrees (if applicable)
+- "turn_radius": Radius for curved movements (if applicable)
+- "stop_condition": When to stop ("time", "distance", "obstacle")
 
 ---
 
-User command: "{command}"
-AI Output (JSON array only):
+### Convert the following user command into JSON format:
+
+User: "{command}"
+AI Output:
 """
 
 
@@ -201,7 +192,7 @@ LOGIN_HTML = """
 </head>
 <body>
     <div class="login-container">
-        <h1>🤖 Robot Control</h1>
+        <h1> Robot Control</h1>
         <h2>Login</h2>
         <form action="/auth" method="post">
             <input type="text" name="username" placeholder="Username" required>
@@ -409,7 +400,7 @@ ROBOT_INTERFACE_HTML = """
 <body>
     <div class="container">
         <div class="chatbox">
-            <h1>🤖 Robot Control Interface</h1>
+            <h1> Robot Control Interface</h1>
             
             <div class="status-bar">
                 <span>Status: <span id="voiceStatus">Initializing...</span></span>
@@ -425,7 +416,7 @@ ROBOT_INTERFACE_HTML = """
             <form id="commandForm" method="POST" action="/send_command">
                 <input type="text" id="command" name="command" placeholder="Enter movement command or say 'Hey Robot'..." required>
                 <div>
-                    <button type="button" class="btn-speak" onclick="manualStartListening()">🎤 Speak</button>
+                    <button type="button" class="btn-speak" onclick="manualStartListening()"> Speak</button>
                     <button type="submit">Send Command</button>
                 </div>
             </form>
@@ -446,10 +437,10 @@ ROBOT_INTERFACE_HTML = """
                 </div>
             </div>
             
-            <h2>🔍 Generated Robot Commands: <span id="responseStatus"></span></h2>
+            <h2> Generated Robot Commands: <span id="responseStatus"></span></h2>
             <pre id="response">No command sent yet.</pre>
             
-            <a class="logout" href="/logout">🚪 Logout</a>
+            <a class="logout" href="/logout"> Logout</a>
         </div>
     </div>
 
@@ -497,7 +488,7 @@ ROBOT_INTERFACE_HTML = """
             const lastResult = event.results[event.results.length - 1];
             const transcript = lastResult[0].transcript.trim().toLowerCase();
             
-            console.log(`🎤 Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
+            console.log(` Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
             
             if (isListeningForTrigger) {
                 // Check for trigger phrases
