@@ -203,8 +203,6 @@ Always provide complete, valid JSON that a robot can execute immediately.
             "description": "Error in API communication"
         }
 
-
-   
 # HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -736,6 +734,55 @@ def send_command():
     except Exception as e:
         logger.error(f"Error processing command: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+# New endpoint for ESP32 communication
+@app.route('/api/robot_command', methods=['GET', 'POST'])
+def robot_command():
+    # Simple authentication using API key instead of session-based auth
+    api_key = request.headers.get('X-API-Key')
+    if not api_key or api_key != '1234' :
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    # For GET requests, return the latest command for the robot
+    if request.method == 'GET':
+        # This could be the most recent command in your system
+        if 'robotics' in command_history and command_history['robotics']:
+            # Find the most recent valid command
+            for item in reversed(command_history['robotics']):
+                if isinstance(item, dict) and "commands" in item:
+                    return jsonify(item)
+            
+        return jsonify({"error": "No commands available"}), 404
+    
+    # For POST requests, allow the ESP32 to send status updates
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            # Process status update from ESP32
+            logger.info(f"Received status update from ESP32: {data}")
+            
+            # Store the status update if needed
+            if 'status' in data and 'commandId' in data:
+                status_update = {
+                    "timestamp": time.time(),
+                    "status": data['status'],
+                    "commandId": data['commandId']
+                }
+                
+                # You could store this in a database or in memory
+                if 'esp32_status' not in command_history:
+                    command_history['esp32_status'] = []
+                
+                command_history['esp32_status'].append(status_update)
+                
+                # Keep only the last 20 status updates
+                if len(command_history['esp32_status']) > 20:
+                    command_history['esp32_status'] = command_history['esp32_status'][-20:]
+            
+            return jsonify({"status": "received"}), 200
+        except Exception as e:
+            logger.error(f"Error processing ESP32 status update: {str(e)}")
+            return jsonify({"error": str(e)}), 400
 
 if __name__ == '__main__':
     # For development, otherwise use production WSGI server
