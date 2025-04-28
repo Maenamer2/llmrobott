@@ -94,7 +94,7 @@ Output: JSON object representing the commands
 
 **Supported Movements:**
 - Linear motion: "forward", "backward" with speed (m/s) and either distance (m) or time (s)
-- Rotation: "left", "right" with angular_speed (degrees/s) and rotation (degrees)
+- Rotation: "left", "right" with degrees
 - Arc movements: Curved paths with specified radius and direction
 - Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
 - Sequential movements: Multiple commands in sequence
@@ -103,51 +103,26 @@ Output: JSON object representing the commands
 {
   "commands": [
     {
-      // For LINEAR movement:
-      "mode": "linear",
-      "direction": "forward|backward",
+      "mode": "linear|rotate|arc|stop",
+      "direction": "forward|backward|left|right",
       "speed": float,  // meters per second (0.1-2.0)
       "distance": float,  // meters (if applicable)
       "time": float,  // seconds (if applicable)
+      "rotation": float,  // degrees (if applicable)
+      "turn_radius": float,  // meters (for arc movements)
       "stop_condition": "time|distance|obstacle"  // when to stop
-    },
-    {
-      // For ROTATION movement:
-      "mode": "rotate",
-      "direction": "left|right",
-      "angular_speed": float,  // degrees per second (10-90)
-      "rotation": float,  // degrees to rotate
-      "time": float,  // seconds (max time for rotation, if specified)
-      "stop_condition": "rotation|time|obstacle"  // primary condition to stop
-    },
-    {
-      // For ARC movement:
-      "mode": "arc",
-      "direction": "forward_left|forward_right|backward_left|backward_right",
-      "speed": float,  // linear speed in meters per second (0.1-2.0)
-      "angular_speed": float,  // degrees per second (10-90)
-      "turn_radius": float,  // meters (radius of the arc)
-      "distance": float,  // arc length in meters (if applicable)
-      "rotation": float,  // degrees of rotation (if applicable)
-      "time": float,  // seconds (if applicable)
-      "stop_condition": "distance|rotation|time|obstacle"  // when to stop
     },
     // Additional commands for sequences
   ],
   "description": "Brief human-readable description of what the robot will do"
 }
 
-For shapes, break them down into appropriate primitive movements.
-
-When qualitative terms are used:
-- "slowly" = 0.3-0.5 m/s or 10-20 deg/s
-- "normal" = 0.8-1.2 m/s or 30 deg/s
-- "quickly/fast" = 1.5-2.0 m/s or 60-90 deg/s
-
-IMPORTANT: Include ONLY relevant parameters for each movement type. Do not include irrelevant parameters:
-- For linear motion: don't include rotation, angular_speed, or turn_radius
-- For rotation: don't include distance, speed (use angular_speed instead), or turn_radius
-- For stop_condition, choose the most appropriate primary condition
+For shapes, break them down into appropriate primitive movements:
+- Square: 4 forward movements with 90° right/left turns
+- Circle: A series of short arcs that form a complete 360° path
+- Triangle: 3 forward movements with 120° turns
+- Rectangle: 2 pairs of different-length forward movements with 90° turns
+- Figure-eight: Two connected circles in opposite directions
 
 Always provide complete, valid JSON that a robot can execute immediately.
 """
@@ -196,24 +171,6 @@ Always provide complete, valid JSON that a robot can execute immediately.
                     "description": "Invalid command structure - missing commands array"
                 }]
             
-            # Ensure each command has only relevant parameters
-            for cmd in parsed_data["commands"]:
-                if cmd["mode"] == "linear":
-                    # Remove rotation-specific parameters from linear movement
-                    for param in ["rotation", "angular_speed", "turn_radius"]:
-                        if param in cmd:
-                            del cmd[param]
-                
-                elif cmd["mode"] == "rotate":
-                    # Remove linear-specific parameters from rotation
-                    for param in ["distance", "speed", "turn_radius"]:
-                        if param in cmd:
-                            del cmd[param]
-                    
-                    # Ensure angular_speed exists for rotations
-                    if "angular_speed" not in cmd:
-                        cmd["angular_speed"] = 30  # Default angular speed (degrees/s)
-            
             return parsed_data
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {e}, raw output: {raw_output}")
@@ -234,7 +191,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
                     "mode": "stop",
                     "description": "Command parsing error - robot stopped"
                 }],
-                "description": "Error in command processing"
+                "description": "Error in command processing"  # Removed sequence_type
             }
 
     except Exception as e:
@@ -245,7 +202,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
                 "mode": "stop",
                 "description": "API error - robot stopped"
             }],
-            "description": "Error in API communication"
+            "description": "Error in API communication"  # Removed sequence_type
         }
 
 # HTML Templates
