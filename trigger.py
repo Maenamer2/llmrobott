@@ -140,7 +140,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
 
     try:
         response = openai.chat.completions.create(
-            model="4o-mini",  # Changed from gpt-3.5-turbo to 4o-mini
+            model="gpt-4o-mini",  # Changed from gpt-3.5-turbo to 4o-mini
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
