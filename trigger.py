@@ -114,7 +114,6 @@ Output: JSON object representing the commands
     },
     // Additional commands for sequences
   ],
-  "sequence_type": "parallel|sequential",
   "description": "Brief human-readable description of what the robot will do"
 }
 
@@ -141,7 +140,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="4o-mini",  # Changed from gpt-3.5-turbo to 4o-mini
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -156,8 +155,13 @@ Always provide complete, valid JSON that a robot can execute immediately.
         try:
             parsed_data = json.loads(raw_output)
             
-            # Add metadata
-            parsed_data["timestamp"] = time.time()
+            # Remove timestamp and sequence_type if present
+            if "timestamp" in parsed_data:
+                del parsed_data["timestamp"]
+                
+            if "sequence_type" in parsed_data:
+                del parsed_data["sequence_type"]
+            
             parsed_data["original_command"] = command
             
             # Validate the JSON structure
@@ -187,8 +191,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
                     "mode": "stop",
                     "description": "Command parsing error - robot stopped"
                 }],
-                "sequence_type": "sequential",
-                "description": "Error in command processing"
+                "description": "Error in command processing"  # Removed sequence_type
             }
 
     except Exception as e:
@@ -199,8 +202,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
                 "mode": "stop",
                 "description": "API error - robot stopped"
             }],
-            "sequence_type": "sequential",
-            "description": "Error in API communication"
+            "description": "Error in API communication"  # Removed sequence_type
         }
 
 # HTML Templates
