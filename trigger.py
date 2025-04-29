@@ -83,6 +83,7 @@ def rate_limit(f):
 def interpret_command(command, previous_commands=None):
     """
     Enhanced function to interpret human commands with context from previous commands.
+    Improved to handle directional commands more logically.
     """
     # Define a more detailed system prompt with improved prompt engineering
     system_prompt = """You are an AI that converts natural language movement instructions into structured JSON commands for a 4-wheeled robot.
@@ -93,9 +94,9 @@ Input: Natural language instructions for robot movement
 Output: JSON object representing the commands
 
 **Supported Movements:**
-- Linear motion: "forward", "backward" with speed (m/s) and either distance (m) or time (s)
-- Rotation: "left", "right" with degrees
-- Arc movements: Curved paths with specified radius and direction
+- Linear motion: Use "mode": "linear" with "direction": "forward" or "backward", with speed (m/s) and either distance (m) or time (s)
+- Rotation: Use "mode": "rotate" with "direction": "left" or "right", with degrees and speed
+- Arc movements: Use "mode": "arc" for curved paths with specified radius and direction
 - Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
 - Sequential movements: Multiple commands in sequence
 
@@ -116,6 +117,23 @@ Output: JSON object representing the commands
   ],
   "description": "Brief human-readable description of what the robot will do"
 }
+
+**IMPORTANT RULES:**
+1. For rotation movements:
+   - Use "mode": "rotate" with "direction": "left" or "right"
+   - Always specify a rotation value in degrees (default to 90 if not specified)
+   - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
+   - Use "stop_condition": "time" if time is specified, otherwise "rotation"
+
+2. For linear movements:
+   - Use "mode": "linear" with "direction": "forward" or "backward"
+   - Never use "left" or "right" as direction for linear movements
+   - For "go right" type instructions, interpret as "rotate right, then go forward"
+   - For "go left quickly for 5 meters", interpret as "rotate left, then go forward for 5 meters"
+
+3. For sequences:
+   - Break each logical movement into its own command object
+   - Make sure speeds match descriptions (e.g., "quickly" = 1.5-2.0 m/s, "slowly" = 0.3-0.7 m/s)
 
 For shapes, break them down into appropriate primitive movements:
 - Square: 4 forward movements with 90° right/left turns
