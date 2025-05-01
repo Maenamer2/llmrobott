@@ -7,6 +7,8 @@ import time
 import logging
 import re
 from functools import wraps
+import base64
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -23,9 +25,9 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Improved data structure for users (in production, use a proper database)
 USERS = {
-    "maen": {"password": "maen", "role": "admin"},
-    "user1": {"password": "password1", "role": "user"},
-    "robotics": {"password": "securepass", "role": "user"}
+    "maen": {"password": "maen", "role": "admin", "voice_print": None},
+    "user1": {"password": "password1", "role": "user", "voice_print": None},
+    "robotics": {"password": "securepass", "role": "user", "voice_print": None}
 }
 
 # Command history for audit and improved responses
@@ -223,6 +225,53 @@ Always provide complete, valid JSON that a robot can execute immediately.
             "description": "Error in API communication"  # Removed sequence_type
         }
 
+def compare_voice_prints(voice_print1, voice_print2, threshold=0.85):
+    """
+    Compare two voice prints (simplified implementation)
+    In a real-world scenario, you would use a proper voice recognition API
+    or machine learning model for this comparison
+    """
+    if not voice_print1 or not voice_print2:
+        return False
+    
+    # Simple string comparison for demonstration
+    # In production, use a proper voice biometric system
+    similarity = 1.0 if voice_print1 == voice_print2 else 0.0
+    
+    return similarity >= threshold
+
+def process_voice_auth(username, voice_data):
+    """
+    Process voice authentication for a user
+    """
+    try:
+        if username not in USERS:
+            return False, "User not found"
+        
+        # Process audio data (base64 encoded)
+        # This is a simplified version - in a real system we would:
+        # 1. Convert audio to a standardized format
+        # 2. Extract voice features using techniques like MFCC
+        # 3. Compare against stored voiceprint using a model
+        
+        # For demo purposes, we'll just hash the audio data as a "voice print"
+        voice_hash = hashlib.sha256(voice_data.encode()).hexdigest()
+        
+        # If user doesn't have a voice print yet, save this one
+        if not USERS[username]["voice_print"]:
+            USERS[username]["voice_print"] = voice_hash
+            return True, "Voice print registered"
+            
+        # Compare with stored voice print
+        if compare_voice_prints(USERS[username]["voice_print"], voice_hash):
+            return True, "Voice authentication successful"
+        else:
+            return False, "Voice authentication failed"
+            
+    except Exception as e:
+        logger.error(f"Voice authentication error: {str(e)}")
+        return False, f"Error processing voice authentication: {str(e)}"
+
 # HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -238,19 +287,206 @@ LOGIN_HTML = """
         button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
         button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
         .error { color: #f87171; margin-top: 10px; }
+        .success { color: #4ade80; margin-top: 10px; }
+        .tabs { display: flex; margin-bottom: 20px; }
+        .tab { flex: 1; padding: 10px; background-color: #475569; cursor: pointer; }
+        .tab.active { background-color: #0284c7; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .voice-auth-container { margin-top: 20px; padding-top: 20px; border-top: 1px solid #4b5563; }
+        .voice-status { font-size: 14px; margin: 10px 0; }
+        .record-btn { background-color: #ef4444; display: inline-flex; align-items: center; justify-content: center; }
+        .record-btn.recording { animation: pulse 1.5s infinite; }
+        .record-btn svg { margin-right: 8px; }
+        .voice-phrase { font-size: 18px; background-color: #475569; padding: 15px; border-radius: 10px; margin: 15px 0; }
+        @keyframes pulse {
+            0% { opacity: 0.7; }
+            50% { opacity: 1; }
+            100% { opacity: 0.7; }
+        }
     </style>
 </head>
 <body>
     <div class="login-container">
         <h1> Robot Control</h1>
         <h2>Login</h2>
-        <form action="/auth" method="post">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
-        </form>
+        
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('password')">Password</div>
+            <div class="tab" onclick="switchTab('voice')">Voice</div>
+        </div>
+        
+        <!-- Password Login Tab -->
+        <div id="password-tab" class="tab-content active">
+            <form id="password-form" action="/auth" method="post">
+                <input type="text" name="username" id="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+        
+        <!-- Voice Login Tab -->
+        <div id="voice-tab" class="tab-content">
+            <form id="voice-form" action="/voice_auth" method="post">
+                <input type="text" name="username" id="voice-username" placeholder="Username" required>
+                <div class="voice-phrase">
+                    Say: "My voice is my passport, verify me"
+                </div>
+                <div class="voice-status" id="voice-status">Ready to record</div>
+                <button type="button" id="record-btn" class="record-btn" onclick="toggleRecording()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="6"></circle>
+                    </svg>
+                    Record Voice
+                </button>
+                <input type="hidden" name="voice_data" id="voice-data">
+                <button type="submit" id="voice-submit" disabled>Login with Voice</button>
+            </form>
+        </div>
+        
         <p class="error" id="errorMsg" style="display: none;"></p>
+        <p class="success" id="successMsg" style="display: none;"></p>
     </div>
+
+    <script>
+        // Tab switching functionality
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            
+            document.querySelector(`.tab:nth-child(${tabName === 'password' ? 1 : 2})`).classList.add('active');
+            document.getElementById(`${tabName}-tab`).classList.add('active');
+            
+            // Clear error messages when switching tabs
+            document.getElementById('errorMsg').style.display = 'none';
+            document.getElementById('successMsg').style.display = 'none';
+            
+            // Sync usernames between tabs
+            if (tabName === 'voice') {
+                document.getElementById('voice-username').value = document.getElementById('username').value;
+            } else {
+                document.getElementById('username').value = document.getElementById('voice-username').value;
+            }
+        }
+        
+        // Voice recording functionality
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        
+        async function setupMediaRecorder() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                
+                mediaRecorder.addEventListener('dataavailable', event => {
+                    audioChunks.push(event.data);
+                });
+                
+                mediaRecorder.addEventListener('stop', () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    const reader = new FileReader();
+                    
+                    reader.onload = () => {
+                        const base64Audio = reader.result.split(',')[1];
+                        document.getElementById('voice-data').value = base64Audio;
+                        document.getElementById('voice-status').textContent = 'Recording complete';
+                        document.getElementById('voice-submit').disabled = false;
+                    };
+                    
+                    reader.readAsDataURL(audioBlob);
+                });
+                
+                document.getElementById('voice-status').textContent = 'Microphone ready';
+            } catch (err) {
+                document.getElementById('voice-status').textContent = `Error: ${err.message}`;
+                document.getElementById('record-btn').disabled = true;
+            }
+        }
+        
+        function toggleRecording() {
+            if (isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                document.getElementById('record-btn').textContent = 'Record Again';
+                document.getElementById('record-btn').classList.remove('recording');
+            } else {
+                audioChunks = [];
+                mediaRecorder.start();
+                isRecording = true;
+                document.getElementById('voice-status').textContent = 'Recording...';
+                document.getElementById('record-btn').textContent = 'Stop Recording';
+                document.getElementById('record-btn').classList.add('recording');
+                document.getElementById('voice-submit').disabled = true;
+                
+                // Auto-stop after 5 seconds
+                setTimeout(() => {
+                    if (isRecording) {
+                        toggleRecording();
+                    }
+                }, 5000);
+            }
+        }
+        
+        // Initialize voice recording when switching to voice tab
+        document.querySelector('.tab:nth-child(2)').addEventListener('click', () => {
+            if (!mediaRecorder) {
+                setupMediaRecorder();
+            }
+        });
+        
+        // Handle voice authentication form submission
+        document.getElementById('voice-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const username = formData.get('username');
+            const voiceData = formData.get('voice_data');
+            
+            if (!username || !voiceData) {
+                document.getElementById('errorMsg').textContent = 'Username and voice recording are required';
+                document.getElementById('errorMsg').style.display = 'block';
+                return;
+            }
+            
+            fetch('/voice_auth', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    username: username,
+                    voice_data: voiceData
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('successMsg').textContent = data.message;
+                    document.getElementById('successMsg').style.display = 'block';
+                    document.getElementById('errorMsg').style.display = 'none';
+                    
+                    // Redirect to home page after successful login
+                    setTimeout(() => {
+                        window.location.href = '/home';
+                    }, 1000);
+                } else {
+                    document.getElementById('errorMsg').textContent = data.message;
+                    document.getElementById('errorMsg').style.display = 'block';
+                    document.getElementById('successMsg').style.display = 'none';
+                }
+            })
+            .catch(error => {
+                document.getElementById('errorMsg').textContent = 'An error occurred. Please try again.';
+                document.getElementById('errorMsg').style.display = 'block';
+                console.error('Error:', error);
+            });
+        });
+    </script>
 </body>
 </html>
 """
@@ -531,7 +767,7 @@ ROBOT_INTERFACE_HTML = """
             } else if (status.includes('Processing')) {
                 robotFace.className = 'active';
             }
-        }
+             }
         
         // Process speech results
         recognition.onresult = function(event) {
@@ -807,3 +1043,4 @@ def robot_command():
 if __name__ == '__main__':
     # For development, otherwise use production WSGI server
     app.run(debug=True, host='0.0.0.0', port=5000)
+
