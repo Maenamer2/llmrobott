@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
+app.secret_key = os.getenv("SECRET_KEY", "robotics_secret_key_2024")  # Better to use env variable on Render
+app.config['SESSION_COOKIE_SECURE'] = os.getenv("ENVIRONMENT", "development") == "production"
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
 
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -136,7 +139,8 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user' not in session:
-            return jsonify({"error": "Authentication required"}), 401
+            # Return a redirect response instead of JSON for better user experience
+            return redirect(url_for('login_page'))
         return f(*args, **kwargs)
     return decorated_function
 
@@ -146,7 +150,7 @@ def rate_limit(f):
     def decorated_function(*args, **kwargs):
         user = session.get('user')
         if not user or user not in USERS:
-            return jsonify({"error": "Authentication required"}), 401
+            return redirect(url_for('login'))
         
         # Get user's role and corresponding rate limit
         role = USERS[user].get('role', 'user')
