@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash
 import openai
 import json
 from dotenv import load_dotenv
@@ -6,38 +6,47 @@ import os
 import time
 import logging
 import re
+import hashlib
+import datetime
 from functools import wraps
 
-# Configure logging
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
+app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  
 
-# Configure OpenAI
+
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Improved data structure for users (in production, use a proper database)
+
+# Enhanced user storage with password hashing and role management
 USERS = {
-    "maen": {"password": "maen", "role": "admin"},
-    "user1": {"password": "password1", "role": "user"},
-    "robotics": {"password": "securepass", "role": "user"}
+    "maen": {"password_hash": hashlib.sha256("maen".encode()).hexdigest(), "role": "admin", "failed_attempts": 0, "lockout_until": None}
 }
 
-# Command history for audit and improved responses
+
+# Dictionary to track registration attempts to prevent abuse
+registration_attempts = {}
+
+
+# Function to hash passwords
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
 command_history = {}
 
-# Rate limiting configuration
+
 rate_limits = {
-    "admin": {"requests": 50, "period": 3600},  # 50 requests per hour
-    "user": {"requests": 20, "period": 3600}    # 20 requests per hour
+    "admin": {"requests": 50, "period": 3600},  
+    "user": {"requests": 20, "period": 3600}    
 }
 
-# Decorator for authentication
+
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -46,7 +55,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# Decorator for rate limiting
+
 def rate_limit(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -54,20 +63,17 @@ def rate_limit(f):
         if not user or user not in USERS:
             return jsonify({"error": "Authentication required"}), 401
         
-        # Get user's role and corresponding rate limit
+        
         role = USERS[user].get('role', 'user')
         limit = rate_limits.get(role, rate_limits['user'])
         
-        # Initialize history if not exists
         if user not in command_history:
             command_history[user] = []
         
-        # Clean up old requests
         current_time = time.time()
         command_history[user] = [t for t in command_history[user] 
                                  if isinstance(t, float) and current_time - t < limit['period']]
         
-        # Check if limit exceeded
         if len(command_history[user]) >= limit['requests']:
             return jsonify({
                 "error": f"Rate limit exceeded. Maximum {limit['requests']} requests per {limit['period']//3600} hour(s).",
@@ -80,6 +86,27 @@ def rate_limit(f):
         return f(*args, **kwargs)
     return decorated_function
 
+
+# Function to validate password strength
+def is_password_strong(password):
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    
+    if not re.search(r'[A-Z]', password):
+        return False, "Password must contain at least one uppercase letter"
+    
+    if not re.search(r'[a-z]', password):
+        return False, "Password must contain at least one lowercase letter"
+    
+    if not re.search(r'[0-9]', password):
+        return False, "Password must contain at least one digit"
+    
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False, "Password must contain at least one special character"
+    
+    return True, "Password is strong"
+
+
 def interpret_command(command, previous_commands=None):
     """
     Enhanced function to interpret human commands with context from previous commands.
@@ -87,8 +114,7 @@ def interpret_command(command, previous_commands=None):
     """
     # Define a more detailed system prompt with improved prompt engineering
     system_prompt = """You are an AI that converts natural language movement instructions into structured JSON commands for a 4-wheeled robot.
-
-You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
+    You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
 
 Input: Natural language instructions for robot movement
 Output: JSON object representing the commands
@@ -143,12 +169,13 @@ For shapes, break them down into appropriate primitive movements:
 - Figure-eight: Two connected circles in opposite directions
 
 Always provide complete, valid JSON that a robot can execute immediately.
+
 """
 
-    # User prompt with context
+    
     user_prompt = f"Convert this command into a structured robot command: \"{command}\""
     
-    # Add context from previous commands if available
+   
     if previous_commands and len(previous_commands) > 0:
         recent_commands = previous_commands[-3:]  # Last 3 commands
         context = "Previous commands for context:\n" + "\n".join([
@@ -158,13 +185,13 @@ Always provide complete, valid JSON that a robot can execute immediately.
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",  # Changed from gpt-3.5-turbo to 4o-mini
+            model="gpt-4o-mini",  
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,  # Lower temperature for more consistent outputs
-            response_format={"type": "json_object"}  # Ensure JSON response
+            temperature=0.33,  
+            response_format={"type": "json_object"}  
         )
 
         raw_output = response.choices[0].message.content
@@ -173,7 +200,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
         try:
             parsed_data = json.loads(raw_output)
             
-            # Remove timestamp and sequence_type if present
+            
             if "timestamp" in parsed_data:
                 del parsed_data["timestamp"]
                 
@@ -182,7 +209,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
             
             parsed_data["original_command"] = command
             
-            # Validate the JSON structure
+            
             if "commands" not in parsed_data:
                 parsed_data["commands"] = [{
                     "mode": "stop",
@@ -193,7 +220,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {e}, raw output: {raw_output}")
             
-            # Try to extract JSON from the response using regex - useful for debugging
+            
             json_match = re.search(r'```json(.*?)```', raw_output, re.DOTALL)
             if json_match:
                 try:
@@ -202,7 +229,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
                 except:
                     pass
             
-            # Fallback response if parsing fails
+            
             return {
                 "error": "Failed to parse response as JSON",
                 "commands": [{
@@ -223,7 +250,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
             "description": "Error in API communication"  # Removed sequence_type
         }
 
-# HTML Templates
+
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -238,19 +265,210 @@ LOGIN_HTML = """
         button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
         button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
         .error { color: #f87171; margin-top: 10px; }
+        .success { color: #10b981; margin-top: 10px; }
+        .message { margin-top: 10px; }
+        .tab-buttons { display: flex; margin-bottom: 20px; }
+        .tab-button { flex: 1; padding: 10px; background-color: #475569; color: white; border: none; cursor: pointer; }
+        .tab-button.active { background-color: #0284c7; }
+        .tab-button:first-child { border-radius: 10px 0 0 10px; }
+        .tab-button:last-child { border-radius: 0 10px 10px 0; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .password-strength { font-size: 14px; text-align: left; margin-top: 5px; }
+        .password-weak { color: #f87171; }
+        .password-medium { color: #fbbf24; }
+        .password-strong { color: #10b981; }
+        .register-link, .login-link { color: #60a5fa; cursor: pointer; margin-top: 15px; display: inline-block; }
+        .register-link:hover, .login-link:hover { text-decoration: underline; }
+        .countdown { font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="login-container">
-        <h1> Robot Control</h1>
-        <h2>Login</h2>
-        <form action="/auth" method="post">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
-        </form>
-        <p class="error" id="errorMsg" style="display: none;"></p>
+        <h1>Robot Control</h1>
+        
+        <div class="tab-buttons">
+            <button class="tab-button active" onclick="switchTab('login')">Login</button>
+            <button class="tab-button" onclick="switchTab('register')">Register</button>
+        </div>
+        
+        <div id="login" class="tab-content active">
+            <h2>Login</h2>
+            <form action="/auth" method="post">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" id="login-password" placeholder="Password" required>
+                <button type="submit">Login</button>
+            </form>
+            <div class="message" id="loginMessage"></div>
+        </div>
+        
+        <div id="register" class="tab-content">
+            <h2>Register</h2>
+            <form action="/register" method="post" onsubmit="return validateRegistration()">
+                <input type="text" name="username" id="reg-username" placeholder="Username" required>
+                <input type="password" name="password" id="reg-password" placeholder="Password" required oninput="checkPasswordStrength()">
+                <div class="password-strength" id="password-strength-meter"></div>
+                <input type="password" name="confirm_password" id="confirm-password" placeholder="Confirm Password" required>
+                <button type="submit">Register</button>
+            </form>
+            <div class="message" id="registerMessage"></div>
+            <div class="password-requirements" style="text-align: left; margin-top: 15px; font-size: 14px;">
+                <p>Password must:</p>
+                <ul>
+                    <li>Be at least 8 characters long</li>
+                    <li>Contain at least one uppercase letter</li>
+                    <li>Contain at least one lowercase letter</li>
+                    <li>Contain at least one number</li>
+                    <li>Contain at least one special character</li>
+                </ul>
+            </div>
+        </div>
     </div>
+    
+    <script>
+        function switchTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-button').forEach(button => {
+                button.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName).classList.add('active');
+            document.querySelector(`.tab-button:nth-child(${tabName === 'login' ? 1 : 2})`).classList.add('active');
+        }
+        
+        function checkPasswordStrength() {
+            const password = document.getElementById('reg-password').value;
+            const meter = document.getElementById('password-strength-meter');
+            
+            // Clear previous strength indicator
+            meter.className = 'password-strength';
+            
+            if (password.length === 0) {
+                meter.textContent = '';
+                return;
+            }
+            
+            // Check strength
+            let strength = 0;
+            if (password.length >= 8) strength++;
+            if (/[A-Z]/.test(password)) strength++;
+            if (/[a-z]/.test(password)) strength++;
+            if (/[0-9]/.test(password)) strength++;
+            if (/[!@#$%^&*(),.?":{}|<>]/.test(password)) strength++;
+            
+            // Display strength
+            if (strength < 3) {
+                meter.textContent = 'Weak password';
+                meter.classList.add('password-weak');
+            } else if (strength < 5) {
+                meter.textContent = 'Medium strength password';
+                meter.classList.add('password-medium');
+            } else {
+                meter.textContent = 'Strong password';
+                meter.classList.add('password-strong');
+            }
+        }
+        
+        function validateRegistration() {
+            const password = document.getElementById('reg-password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+            const messageDiv = document.getElementById('registerMessage');
+            
+            if (password !== confirmPassword) {
+                messageDiv.textContent = 'Passwords do not match';
+                messageDiv.className = 'error';
+                return false;
+            }
+            
+            // Check for password strength
+            let meetsRequirements = true;
+            let errorMessage = '';
+            
+            if (password.length < 8) {
+                meetsRequirements = false;
+                errorMessage = 'Password must be at least 8 characters long';
+            } else if (!/[A-Z]/.test(password)) {
+                meetsRequirements = false;
+                errorMessage = 'Password must contain at least one uppercase letter';
+            } else if (!/[a-z]/.test(password)) {
+                meetsRequirements = false;
+                errorMessage = 'Password must contain at least one lowercase letter';
+            } else if (!/[0-9]/.test(password)) {
+                meetsRequirements = false;
+                errorMessage = 'Password must contain at least one digit';
+            } else if (!/[!@#$%^&*(),.?":{}|<>]/.test(password)) {
+                meetsRequirements = false;
+                errorMessage = 'Password must contain at least one special character';
+            }
+            
+            if (!meetsRequirements) {
+                messageDiv.textContent = errorMessage;
+                messageDiv.className = 'error';
+                return false;
+            }
+            
+            return true;
+        }
+        
+        // Check for error or success messages
+        document.addEventListener('DOMContentLoaded', function() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const loginError = urlParams.get('login_error');
+            const registerSuccess = urlParams.get('register_success');
+            const registerError = urlParams.get('register_error');
+            const lockoutTime = urlParams.get('lockout_time');
+            
+            if (loginError) {
+                const messageDiv = document.getElementById('loginMessage');
+                messageDiv.textContent = decodeURIComponent(loginError);
+                messageDiv.className = 'error';
+                
+                if (lockoutTime) {
+                    startCountdown(parseInt(lockoutTime), messageDiv);
+                }
+            }
+            
+            if (registerSuccess) {
+                const messageDiv = document.getElementById('loginMessage');
+                messageDiv.textContent = decodeURIComponent(registerSuccess);
+                messageDiv.className = 'success';
+                switchTab('login');
+            }
+            
+            if (registerError) {
+                const messageDiv = document.getElementById('registerMessage');
+                messageDiv.textContent = decodeURIComponent(registerError);
+                messageDiv.className = 'error';
+                switchTab('register');
+            }
+        });
+        
+        function startCountdown(seconds, element) {
+            const countdownSpan = document.createElement('span');
+            countdownSpan.className = 'countdown';
+            element.appendChild(document.createElement('br'));
+            element.appendChild(document.createTextNode('Try again in '));
+            element.appendChild(countdownSpan);
+            element.appendChild(document.createTextNode(' seconds'));
+            
+            function updateCountdown() {
+                countdownSpan.textContent = seconds;
+                if (seconds <= 0) {
+                    clearInterval(interval);
+                    element.textContent = 'You can try logging in again now';
+                    element.className = 'message';
+                }
+                seconds--;
+            }
+            
+            updateCountdown();
+            const interval = setInterval(updateCountdown, 1000);
+        }
+    </script>
 </body>
 </html>
 """
@@ -727,83 +945,34 @@ def send_command():
         if not command:
             return jsonify({"error": "No command provided"})
         
-        # Get user command history for context (only command strings)
         user_commands = []
         if user in command_history:
-            # Extract original commands from command objects
+    
             user_commands = [
                 item["original_command"] for item in command_history[user] 
                 if isinstance(item, dict) and "original_command" in item
             ]
         
-        # Interpret the command
+       
         interpreted_command = interpret_command(command, user_commands)
         
-        # Store command in history
+       
         if user not in command_history:
             command_history[user] = []
         command_history[user].append(interpreted_command)
         
-        # Limit command history to last 10 commands
+        
         if len(command_history[user]) > 10:
             command_history[user] = command_history[user][-10:]
         
-        # Return the interpreted command
+     
         return jsonify(interpreted_command)
     
     except Exception as e:
         logger.error(f"Error processing command: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# New endpoint for ESP32 communication
-@app.route('/api/robot_command', methods=['GET', 'POST'])
-def robot_command():
-    # Simple authentication using API key instead of session-based auth
-    api_key = request.headers.get('X-API-Key')
-    if not api_key or api_key != '1234' :
-        return jsonify({"error": "Invalid API key"}), 401
-    
-    # For GET requests, return the latest command for the robot
-    if request.method == 'GET':
-        # This could be the most recent command in your system
-        if 'robotics' in command_history and command_history['robotics']:
-            # Find the most recent valid command
-            for item in reversed(command_history['robotics']):
-                if isinstance(item, dict) and "commands" in item:
-                    return jsonify(item)
-            
-        return jsonify({"error": "No commands available"}), 404
-    
-    # For POST requests, allow the ESP32 to send status updates
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
-            # Process status update from ESP32
-            logger.info(f"Received status update from ESP32: {data}")
-            
-            # Store the status update if needed
-            if 'status' in data and 'commandId' in data:
-                status_update = {
-                    "timestamp": time.time(),
-                    "status": data['status'],
-                    "commandId": data['commandId']
-                }
-                
-                # You could store this in a database or in memory
-                if 'esp32_status' not in command_history:
-                    command_history['esp32_status'] = []
-                
-                command_history['esp32_status'].append(status_update)
-                
-                # Keep only the last 20 status updates
-                if len(command_history['esp32_status']) > 20:
-                    command_history['esp32_status'] = command_history['esp32_status'][-20:]
-            
-            return jsonify({"status": "received"}), 200
-        except Exception as e:
-            logger.error(f"Error processing ESP32 status update: {str(e)}")
-            return jsonify({"error": str(e)}), 400
 
 if __name__ == '__main__':
-    # For development, otherwise use production WSGI server
+   
     app.run(debug=True, host='0.0.0.0', port=5000)
