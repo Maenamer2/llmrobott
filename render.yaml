@@ -7,3 +7,13 @@ services:
     envVars:
       - key: OPENAI_API_KEY
         sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: robot-db
+          property: connectionString
+
+databases:
+  - name: robot-db
+    plan: free
