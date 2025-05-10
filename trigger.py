@@ -124,6 +124,7 @@ Output: JSON object representing the commands
    - Always specify a rotation value in degrees (default to 90 if not specified)
    - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
    - Use "stop_condition": "time" if time is specified, otherwise "rotation"
+   1.2) for arc mode specify: turn radius and distance(distance of the arc)
 
 2. For linear movements:
    - Use "mode": "linear" with "direction": "forward" or "backward"
