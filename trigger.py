@@ -7,6 +7,7 @@ import time
 import logging
 import re
 from functools import wraps
+from flask_sqlalchemy import SQLAlchemy
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,20 +17,40 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
+app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")
+
+# Configure PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Improved data structure for users (in production, use a proper database)
-USERS = {
-    "maen": {"password": "maen", "role": "admin"},
-    "user1": {"password": "password1", "role": "user"},
-    "robotics": {"password": "securepass", "role": "user"}
-}
+# Define User model
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    role = db.Column(db.String(20), nullable=False, default='user')
 
-# Command history for audit and improved responses
-command_history = {}
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+# Define CommandHistory model
+class CommandHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    command = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.Float, nullable=False)
+    is_time_record = db.Column(db.Boolean, default=False)
+
+    def __repr__(self):
+        return f'<CommandHistory {self.id}>'
 
 # Rate limiting configuration
 rate_limits = {
@@ -41,7 +62,7 @@ rate_limits = {
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'user' not in session:
+        if 'user_id' not in session:
             return jsonify({"error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return decorated_function
@@ -50,32 +71,54 @@ def login_required(f):
 def rate_limit(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        user = session.get('user')
-        if not user or user not in USERS:
+        if 'user_id' not in session:
             return jsonify({"error": "Authentication required"}), 401
         
+        user_id = session['user_id']
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 401
+        
         # Get user's role and corresponding rate limit
-        role = USERS[user].get('role', 'user')
+        role = user.role
         limit = rate_limits.get(role, rate_limits['user'])
         
-        # Initialize history if not exists
-        if user not in command_history:
-            command_history[user] = []
-        
-        # Clean up old requests
+        # Get recent command time records
         current_time = time.time()
-        command_history[user] = [t for t in command_history[user] 
-                                 if isinstance(t, float) and current_time - t < limit['period']]
+        cutoff_time = current_time - limit['period']
+        
+        # Count recent requests within the time period
+        recent_requests = CommandHistory.query.filter(
+            CommandHistory.user_id == user_id,
+            CommandHistory.is_time_record == True,
+            CommandHistory.timestamp > cutoff_time
+        ).count()
         
         # Check if limit exceeded
-        if len(command_history[user]) >= limit['requests']:
+        if recent_requests >= limit['requests']:
+            oldest_request = CommandHistory.query.filter(
+                CommandHistory.user_id == user_id,
+                CommandHistory.is_time_record == True,
+                CommandHistory.timestamp > cutoff_time
+            ).order_by(CommandHistory.timestamp.asc()).first()
+            
+            retry_after = limit['period'] - (current_time - oldest_request.timestamp)
+            
             return jsonify({
                 "error": f"Rate limit exceeded. Maximum {limit['requests']} requests per {limit['period']//3600} hour(s).",
-                "retry_after": limit['period'] - (current_time - command_history[user][0])
+                "retry_after": retry_after
             }), 429
         
         # Add current request timestamp
-        command_history[user].append(current_time)
+        new_time_record = CommandHistory(
+            user_id=user_id,
+            command="TIME_RECORD",
+            timestamp=current_time,
+            is_time_record=True
+        )
+        db.session.add(new_time_record)
+        db.session.commit()
         
         return f(*args, **kwargs)
     return decorated_function
@@ -88,63 +131,63 @@ def interpret_command(command, previous_commands=None):
     # Define a more detailed system prompt with improved prompt engineering
     system_prompt = """You are an AI that converts natural language movement instructions into structured JSON commands for a 4-wheeled robot.
 
-You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
+    You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
 
-Input: Natural language instructions for robot movement
-Output: JSON object representing the commands
+    Input: Natural language instructions for robot movement
+    Output: JSON object representing the commands
 
-**Supported Movements:**
-- Linear motion: Use "mode": "linear" with "direction": "forward" or "backward", with speed (m/s) and either distance (m) or time (s)
-- Rotation: Use "mode": "rotate" with "direction": "left" or "right", with degrees and speed
-- Arc movements: Use "mode": "arc" for curved paths with specified radius and direction
-- Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
-- Sequential movements: Multiple commands in sequence
+    **Supported Movements:**
+    - Linear motion: Use "mode": "linear" with "direction": "forward" or "backward", with speed (m/s) and either distance (m) or time (s)
+    - Rotation: Use "mode": "rotate" with "direction": "left" or "right", with degrees and speed
+    - Arc movements: Use "mode": "arc" for curved paths with specified radius and direction
+    - Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
+    - Sequential movements: Multiple commands in sequence
 
-**Output Format:**
-{
-  "commands": [
+    **Output Format:**
     {
-      "mode": "linear|rotate|arc|stop",
-      "direction": "forward|backward|left|right",
-      "speed": float,  // meters per second (0.1-2.0)
-      "distance": float,  // meters (if applicable)
-      "time": float,  // seconds (if applicable)
-      "rotation": float,  // degrees (if applicable)
-      "turn_radius": float,  // meters (for arc movements)
-      "stop_condition": "time|distance|obstacle"  // when to stop
-    },
-    // Additional commands for sequences
-  ],
-  "description": "Brief human-readable description of what the robot will do"
-}
+      "commands": [
+        {
+          "mode": "linear|rotate|arc|stop",
+          "direction": "forward|backward|left|right",
+          "speed": float,  // meters per second (0.1-2.0)
+          "distance": float,  // meters (if applicable)
+          "time": float,  // seconds (if applicable)
+          "rotation": float,  // degrees (if applicable)
+          "turn_radius": float,  // meters (for arc movements)
+          "stop_condition": "time|distance|obstacle"  // when to stop
+        },
+        // Additional commands for sequences
+      ],
+      "description": "Brief human-readable description of what the robot will do"
+    }
 
-**IMPORTANT RULES:**
-1. For rotation movements:
-   - Use "mode": "rotate" with "direction": "left" or "right"
-   - Always specify a rotation value in degrees 
-   - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
-   - Use "stop_condition": "time" if time is specified, otherwise "rotation"
-   1.2) for arc mode specify: turn radius and distance(distance of the arc)
+    **IMPORTANT RULES:**
+    1. For rotation movements:
+       - Use "mode": "rotate" with "direction": "left" or "right"
+       - Always specify a rotation value in degrees 
+       - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
+       - Use "stop_condition": "time" if time is specified, otherwise "rotation"
+       1.2) for arc mode specify: turn radius and distance(distance of the arc)
 
-2. For linear movements:
-   - Use "mode": "linear" with "direction": "forward" or "backward"
-   - Never use "left" or "right" as direction for linear movements
-   - For "go right" type instructions, interpret as "rotate right, then go forward"
-   - For "go left quickly for 5 meters", interpret as "rotate left, then go forward for 5 meters"
+    2. For linear movements:
+       - Use "mode": "linear" with "direction": "forward" or "backward"
+       - Never use "left" or "right" as direction for linear movements
+       - For "go right" type instructions, interpret as "rotate right, then go forward"
+       - For "go left quickly for 5 meters", interpret as "rotate left, then go forward for 5 meters"
 
-3. For sequences:
-   - Break each logical movement into its own command object
-   - Make sure speeds match descriptions (e.g., "quickly" = 1.5-2.0 m/s, "slowly" = 0.3-0.7 m/s)
+    3. For sequences:
+       - Break each logical movement into its own command object
+       - Make sure speeds match descriptions (e.g., "quickly" = 1.5-2.0 m/s, "slowly" = 0.3-0.7 m/s)
 
-For shapes, break them down into appropriate primitive movements:
-- Square: 4 forward movements with 90° right/left turns
-- Circle: A arc that forms a complete 360° path
-- Triangle: 3 forward movements with 120° turns
-- Rectangle: 2 pairs of different-length forward movements with 90° turns
-- Figure-eight: Two connected circles in opposite directions
--question mark figure(complrx shape example) : half circle then downwards line movement
-Always provide complete, valid JSON that a robot can execute immediately.
-"""
+    For shapes, break them down into appropriate primitive movements:
+    - Square: 4 forward movements with 90° right/left turns
+    - Circle: A arc that forms a complete 360° path
+    - Triangle: 3 forward movements with 120° turns
+    - Rectangle: 2 pairs of different-length forward movements with 90° turns
+    - Figure-eight: Two connected circles in opposite directions
+    -question mark figure(complrx shape example) : half circle then downwards line movement
+    Always provide complete, valid JSON that a robot can execute immediately.
+    """
 
     # User prompt with context
     user_prompt = f"Convert this command into a structured robot command: \"{command}\""
@@ -223,6 +266,21 @@ Always provide complete, valid JSON that a robot can execute immediately.
             }],
             "description": "Error in API communication"  # Removed sequence_type
         }
+
+# Initialize database tables
+@app.before_first_request
+def create_tables():
+    db.create_all()
+    
+    # Create default users if they don't exist
+    if User.query.filter_by(username='maen').first() is None:
+        default_users = [
+            User(username='maen', password='maen', role='admin'),
+            User(username='user1', password='password1', role='user'),
+            User(username='robotics', password='securepass', role='user')
+        ]
+        db.session.add_all(default_users)
+        db.session.commit()
 
 # HTML Templates
 LOGIN_HTML = """
@@ -689,7 +747,7 @@ ROBOT_INTERFACE_HTML = """
 
 @app.route('/')
 def login():
-    if 'user' in session:
+    if 'user_id' in session:
         return redirect(url_for('home'))
     return LOGIN_HTML
 
@@ -698,24 +756,27 @@ def auth():
     username = request.form.get('username', '')
     password = request.form.get('password', '')
 
-    if username in USERS and USERS[username]["password"] == password:
-        session['user'] = username
+    user = User.query.filter_by(username=username).first()
+    if user and user.password == password:  # In production, use proper password hashing!
+        session['user_id'] = user.id
+        session['username'] = user.username
         return redirect(url_for('home'))
     else:
         error_html = LOGIN_HTML.replace('<p class="error" id="errorMsg" style="display: none;"></p>', 
-                                         '<p class="error" id="errorMsg">Invalid credentials</p>')
+                                        '<p class="error" id="errorMsg">Invalid credentials</p>')
         return error_html
 
 @app.route('/logout')
 def logout():
-    session.pop('user', None)
+    session.pop('user_id', None)
+    session.pop('username', None)
     return redirect(url_for('login'))
 
 @app.route('/home')
 @login_required
 def home():
     # Replace the username placeholder with the actual username
-    return ROBOT_INTERFACE_HTML.replace("{{ username }}", session['user'])
+    return ROBOT_INTERFACE_HTML.replace("{{ username }}", session['username'])
 
 @app.route('/send_command', methods=['POST'])
 @login_required
@@ -723,31 +784,38 @@ def home():
 def send_command():
     try:
         command = request.form.get('command', '').strip()
-        user = session.get('user')
+        user_id = session.get('user_id')
         
         if not command:
             return jsonify({"error": "No command provided"})
         
         # Get user command history for context (only command strings)
         user_commands = []
-        if user in command_history:
-            # Extract original commands from command objects
-            user_commands = [
-                item["original_command"] for item in command_history[user] 
-                if isinstance(item, dict) and "original_command" in item
-            ]
+        recent_commands = CommandHistory.query.filter(
+            CommandHistory.user_id == user_id,
+            CommandHistory.is_time_record == False
+        ).order_by(CommandHistory.timestamp.desc()).limit(10).all()
+        
+        for cmd in recent_commands:
+            try:
+                cmd_data = json.loads(cmd.command)
+                if "original_command" in cmd_data:
+                    user_commands.append(cmd_data["original_command"])
+            except:
+                continue
         
         # Interpret the command
         interpreted_command = interpret_command(command, user_commands)
         
         # Store command in history
-        if user not in command_history:
-            command_history[user] = []
-        command_history[user].append(interpreted_command)
-        
-        # Limit command history to last 10 commands
-        if len(command_history[user]) > 10:
-            command_history[user] = command_history[user][-10:]
+        new_command = CommandHistory(
+            user_id=user_id,
+            command=json.dumps(interpreted_command),
+            timestamp=time.time(),
+            is_time_record=False
+        )
+        db.session.add(new_command)
+        db.session.commit()
         
         # Return the interpreted command
         return jsonify(interpreted_command)
@@ -761,19 +829,29 @@ def send_command():
 def robot_command():
     # Simple authentication using API key instead of session-based auth
     api_key = request.headers.get('X-API-Key')
-    if not api_key or api_key != '1234' :
+    if not api_key or api_key != '1234':
         return jsonify({"error": "Invalid API key"}), 401
     
     # For GET requests, return the latest command for the robot
     if request.method == 'GET':
-        # This could be the most recent command in your system
-        if 'robotics' in command_history and command_history['robotics']:
-            # Find the most recent valid command
-            for item in reversed(command_history['robotics']):
-                if isinstance(item, dict) and "commands" in item:
-                    return jsonify(item)
+        # Get robotics user ID
+        robotics_user = User.query.filter_by(username='robotics').first()
+        if not robotics_user:
+            return jsonify({"error": "Robotics user not found"}), 404
             
-        return jsonify({"error": "No commands available"}), 404
+        # Get the most recent command
+        latest_command = CommandHistory.query.filter_by(
+            user_id=robotics_user.id,
+            is_time_record=False
+        ).order_by(CommandHistory.timestamp.desc()).first()
+        
+        if latest_command:
+            try:
+                return jsonify(json.loads(latest_command.command))
+            except:
+                return jsonify({"error": "Invalid command format"}), 500
+        else:
+            return jsonify({"error": "No commands available"}), 404
     
     # For POST requests, allow the ESP32 to send status updates
     elif request.method == 'POST':
@@ -782,24 +860,7 @@ def robot_command():
             # Process status update from ESP32
             logger.info(f"Received status update from ESP32: {data}")
             
-            # Store the status update if needed
-            if 'status' in data and 'commandId' in data:
-                status_update = {
-                    "timestamp": time.time(),
-                    "status": data['status'],
-                    "commandId": data['commandId']
-                }
-                
-                # You could store this in a database or in memory
-                if 'esp32_status' not in command_history:
-                    command_history['esp32_status'] = []
-                
-                command_history['esp32_status'].append(status_update)
-                
-                # Keep only the last 20 status updates
-                if len(command_history['esp32_status']) > 20:
-                    command_history['esp32_status'] = command_history['esp32_status'][-20:]
-            
+            # Store the status update if needed - you could create another table for this
             return jsonify({"status": "received"}), 200
         except Exception as e:
             logger.error(f"Error processing ESP32 status update: {str(e)}")
