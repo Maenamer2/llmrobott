@@ -1,3 +1,4 @@
+
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import openai
 import json
@@ -267,9 +268,8 @@ def interpret_command(command, previous_commands=None):
             "description": "Error in API communication"  # Removed sequence_type
         }
 
-# Initialize database tables
-@app.before_first_request
-def create_tables():
+with app.app_context():
+    # Create all tables
     db.create_all()
     
     # Create default users if they don't exist
@@ -281,6 +281,9 @@ def create_tables():
         ]
         db.session.add_all(default_users)
         db.session.commit()
+        print("Default users created successfully")
+    else:
+        print("Default users already exist")
 
 # HTML Templates
 LOGIN_HTML = """
