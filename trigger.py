@@ -37,10 +37,10 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=True)  # Made nullable to handle existing records
     password_hash = db.Column(db.String(256), nullable=False)
     role = db.Column(db.String(20), nullable=False, default='user')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, nullable=True)  # Made nullable to handle existing records
     last_login = db.Column(db.DateTime, nullable=True)
     failed_login_attempts = db.Column(db.Integer, default=0)
     account_locked = db.Column(db.Boolean, default=False)
@@ -307,12 +307,57 @@ def interpret_command(command, previous_commands=None):
             "description": "Error in API communication"  # Removed sequence_type
         }
 
-# Database initialization
+# Database migration function to add new columns safely
+def add_column_if_not_exists(engine, table_name, column_name, column_type):
+    """Add a column to a table if it doesn't exist already."""
+    column_exists = False
+    
+    # Check if column already exists
+    inspector = db.inspect(engine)
+    columns = [col['name'] for col in inspector.get_columns(table_name)]
+    column_exists = column_name in columns
+    
+    if not column_exists:
+        # Column doesn't exist, add it
+        try:
+            logger.info(f"Adding column {column_name} to table {table_name}")
+            with engine.connect() as conn:
+                conn.execute(db.text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
+                conn.commit()
+            logger.info(f"Column {column_name} added successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding column {column_name}: {e}")
+            return False
+    else:
+        logger.info(f"Column {column_name} already exists in {table_name}")
+        return True
+
+# Database initialization and migration
 with app.app_context():
-    # Create all tables
+    # Create all tables first (for new tables)
     db.create_all()
     
-    # Check if default users exist
+    # Get database engine
+    engine = db.engine
+    
+    # Add new columns to User table if they don't exist
+    add_column_if_not_exists(engine, 'user', 'email', 'VARCHAR(120) DEFAULT NULL')
+    add_column_if_not_exists(engine, 'user', 'created_at', 'TIMESTAMP DEFAULT NOW()')
+    add_column_if_not_exists(engine, 'user', 'last_login', 'TIMESTAMP DEFAULT NULL')
+    add_column_if_not_exists(engine, 'user', 'failed_login_attempts', 'INTEGER DEFAULT 0')
+    add_column_if_not_exists(engine, 'user', 'account_locked', 'BOOLEAN DEFAULT FALSE')
+    
+    # Make email column unique if it exists
+    try:
+        with engine.connect() as conn:
+            # This SQL is PostgreSQL specific
+            conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email_unique ON \"user\" (email) WHERE email IS NOT NULL"))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error making email column unique: {e}")
+    
+    # Now check for admin user and update/create if needed
     admin = User.query.filter_by(username='maen').first()
     
     if admin is None:
@@ -353,7 +398,202 @@ with app.app_context():
             db.session.rollback()
             print(f"Error creating default users: {str(e)}")
     else:
+        # If admin exists but might be missing email
+        if not hasattr(admin, 'email') or admin.email is None:
+            try:
+                admin.email = 'admin@example.com'
+                db.session.commit()
+                print("Updated admin email")
+            except Exception as e:
+                db.session.rollback()
+                print(f"Error updating admin email: {str(e)}")
         print("Default users already exist")
+
+# Route handlers
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect(url_for('robot_interface'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET'])
+def login():
+    return LOGIN_HTML
+
+@app.route('/auth', methods=['POST'])
+def auth():
+    username = request.form.get('username')
+    password = request.form.get('password')
+    
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+    
+    user = User.query.filter_by(username=username).first()
+    
+    # Check if user exists and is not locked
+    if user and not user.account_locked:
+        if user.check_password(password):
+            # Successful login
+            session['user_id'] = user.id
+            session['username'] = user.username
+            session['role'] = user.role
+            
+            # Reset failed login attempts
+            user.failed_login_attempts = 0
+            user.last_login = datetime.utcnow()
+            db.session.commit()
+            
+            return redirect(url_for('robot_interface'))
+        else:
+            # Failed password
+            user.failed_login_attempts += 1
+            
+            # Lock account after 5 failed attempts
+            if user.failed_login_attempts >= 5:
+                user.account_locked = True
+                
+            db.session.commit()
+            
+            return jsonify({"error": "Invalid password"}), 401
+    elif user and user.account_locked:
+        return jsonify({"error": "Account locked. Please contact an administrator."}), 403
+    else:
+        return jsonify({"error": "User not found"}), 404
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'GET':
+        return REGISTER_HTML
+    
+    if request.method == 'POST':
+        try:
+            # For JSON requests from fetch API
+            if request.is_json:
+                data = request.get_json()
+                username = data.get('username')
+                email = data.get('email')
+                password = data.get('password')
+                confirm_password = data.get('confirm_password')
+            else:
+                # For traditional form submission
+                username = request.form.get('username')
+                email = request.form.get('email')
+                password = request.form.get('password')
+                confirm_password = request.form.get('confirm_password')
+            
+            # Validate input
+            if not username or not email or not password or not confirm_password:
+                return jsonify({"error": "All fields are required"}), 400
+            
+            if password != confirm_password:
+                return jsonify({"error": "Passwords do not match"}), 400
+            
+            # Check if username already exists
+            existing_user = User.query.filter_by(username=username).first()
+            if existing_user:
+                return jsonify({"error": "Username already exists"}), 400
+            
+            # Check if email already exists
+            existing_email = User.query.filter_by(email=email).first()
+            if existing_email:
+                return jsonify({"error": "Email already in use"}), 400
+            
+            # Validate password strength
+            is_valid, message = validate_password(password)
+            if not is_valid:
+                return jsonify({"error": message}), 400
+            
+            # Create new user with default 'user' role
+            new_user = User(
+                username=username,
+                email=email,
+                role='user',
+                created_at=datetime.utcnow()
+            )
+            new_user.set_password(password)
+            
+            db.session.add(new_user)
+            db.session.commit()
+            
+            return jsonify({"success": True, "message": "Registration successful"}), 201
+            
+        except Exception as e:
+            logger.error(f"Registration error: {str(e)}")
+            return jsonify({"error": "An unexpected error occurred"}), 500
+
+@app.route('/robot', methods=['GET'])
+@login_required
+def robot_interface():
+    username = session.get('username', 'Guest')
+    return ROBOT_INTERFACE_HTML.replace('{{ username }}', username)
+
+@app.route('/send_command', methods=['POST'])
+@login_required
+@rate_limit
+def send_command():
+    try:
+        # For JSON requests from fetch API
+        if request.is_json:
+            data = request.get_json()
+            command = data.get('command', '')
+        else:
+            # For traditional form submission
+            command = request.form.get('command', '')
+        
+        if not command:
+            return jsonify({"error": "No command provided"}), 400
+        
+        # Get user ID from session
+        user_id = session.get('user_id')
+        
+        # Get previous commands for context
+        previous_commands = [
+            ch.command for ch in CommandHistory.query.filter_by(
+                user_id=user_id, 
+                is_time_record=False
+            ).order_by(CommandHistory.timestamp.desc()).limit(5).all()
+        ]
+        
+        # Interpret the command
+        interpreted_command = interpret_command(command, previous_commands)
+        
+        # Record the command in history
+        new_command = CommandHistory(
+            user_id=user_id,
+            command=command,
+            timestamp=time.time(),
+            is_time_record=False
+        )
+        db.session.add(new_command)
+        db.session.commit()
+        
+        return jsonify(interpreted_command)
+        
+    except Exception as e:
+        logger.error(f"Command error: {str(e)}")
+        return jsonify({
+            "error": str(e),
+            "commands": [{
+                "mode": "stop",
+                "description": "Server error - robot stopped"
+            }],
+            "description": "Error in server processing"
+        }), 500
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/admin')
+@login_required
+def admin_panel():
+    # Check if user has admin role
+    if session.get('role') != 'admin':
+        return jsonify({"error": "Unauthorized access"}), 403
+    
+    # Render admin panel (Not implemented in this code snippet)
+    return "Admin Panel - Not implemented in this example"
 
 # HTML Templates - Using raw strings to avoid syntax issues with CSS
 LOGIN_HTML = r"""
@@ -636,6 +876,54 @@ ROBOT_INTERFACE_HTML = r"""
     let isListeningForTrigger = false;
     let isListeningForCommand = false;
     let commandTimeout = null;
+    
+    // Function for manual activation of speech recognition
+    function manualStartListening() {
+        if (recognition) {
+            // Stop current recognition if running
+            try {
+                recognition.stop();
+            } catch (e) {
+                console.log("Error stopping recognition:", e);
+            }
+            
+            // Clear any existing timeouts
+            if (commandTimeout) {
+                clearTimeout(commandTimeout);
+            }
+            
+            // Set up for command listening
+            isListeningForTrigger = false;
+            isListeningForCommand = true;
+            recognition.continuous = false;
+            
+            // Start listening
+            try {
+                recognition.start();
+                document.getElementById('voiceStatus').textContent = "Listening for command...";
+                document.getElementById('voiceStatus').className = "listening";
+                document.getElementById('robotFace').className = "listening";
+                
+                // Set timeout for listening
+                commandTimeout = setTimeout(() => {
+                    if (isListeningForCommand) {
+                        recognition.stop();
+                        resetToTriggerMode();
+                        document.getElementById('voiceStatus').textContent = "No command heard. Try again.";
+                        document.getElementById('voiceStatus').className = "";
+                        document.getElementById('robotFace').className = "";
+                    }
+                }, 5000);
+            } catch (e) {
+                console.log("Error starting manual listening:", e);
+                document.getElementById('voiceStatus').textContent = "Speech recognition error";
+                document.getElementById('voiceStatus').className = "";
+                document.getElementById('robotFace').className = "";
+            }
+        } else {
+            alert("Speech recognition not available");
+        }
+    }
 
     function initSpeechRecognition() {
         if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
@@ -726,89 +1014,28 @@ ROBOT_INTERFACE_HTML = r"""
             }, 300);
         }
         
+        // Start listening for trigger words
+        try {
+            recognition.start();
+            isListeningForTrigger = true;
+            updateStatus("Listening for trigger word...");
+        } catch (e) {
+            console.log("Error starting speech recognition:", e);
+            updateStatus("Speech recognition unavailable");
+        }
+        
         // Handle errors
         recognition.onerror = function(event) {
             console.log("⚠️ Speech recognition error:", event.error);
             if (event.error === 'no-speech' || event.error === 'network') {
                 recognition.stop();
-                resetToTriggerMode();
-            } else {
-                updateStatus("Voice recognition error. Restarting...");
-                setTimeout(resetToTriggerMode, 2000);
-            }
-        };
-        
-        // Handle end of recognition
-        recognition.onend = function() {
-            if (isListeningForTrigger) {
                 setTimeout(() => {
-                    try {
-                        recognition.start();
-                    } catch (e) {
-                        console.log("Recognition start error:", e);
-                    }
-                }, 200);
+                    resetToTriggerMode();
+                }, 1000);
+            } else if (event.error === 'aborted' || event.error === 'audio-capture' || event.error === 'not-allowed') {
+                updateStatus("Speech recognition unavailable");
+                isListeningForTrigger = false;
+                isListeningForCommand = false;
             }
         };
-        
-        // Initial start
-        updateStatus("Listening for trigger word...");
-        try {
-            recognition.start();
-            isListeningForTrigger = true;
-        } catch (e) {
-            console.error("Failed to start speech recognition:", e);
-            updateStatus("Failed to start voice recognition");
-        }
-    }
-
-    function manualStartListening() {
-        if (!recognition) return;
-        
-        recognition.stop();
-        isListeningForTrigger = false;
-        isListeningForCommand = true;
-        document.getElementById('voiceStatus').textContent = "Listening for command...";
-        document.getElementById('robotFace').className = 'listening';
-        
-        commandTimeout = setTimeout(() => {
-            if (isListeningForCommand) {
-                recognition.stop();
-                resetToTriggerMode();
-                document.getElementById('voiceStatus').textContent = "No command heard. Try again.";
-            }
-        }, 5000);
-        
-        setTimeout(() => {
-            recognition.continuous = false;
-            recognition.start();
-        }, 200);
-    }
-
-    // Initialize speech recognition and form submission
-    document.addEventListener('DOMContentLoaded', function() {
-        initSpeechRecognition();
-        
-        document.getElementById('commandForm').addEventListener('submit', function(event) {
-            event.preventDefault();
-            let formData = new FormData(this);
-            
-            document.getElementById('responseStatus').textContent = "Processing...";
-            
-            fetch('/send_command', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
-                }
-                return response.json();
-            })
-            .then(data => {
-                const output = JSON.stringify(data, null, 4);
-                document.getElementById('response').textContent = output;
-                document.getElementById('responseStatus').textContent = "Command received";
-            })
-            .catch(error => {
-                document.getElementById('response').textContent = "⚠️ Error: " + error.message """
+        """
