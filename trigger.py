@@ -1038,4 +1038,7 @@ ROBOT_INTERFACE_HTML = r"""
                 isListeningForCommand = false;
             }
         };
-        """
+        </script>
+        </body>
+        </html>
+    """
