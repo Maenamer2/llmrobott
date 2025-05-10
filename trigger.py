@@ -121,7 +121,7 @@ Output: JSON object representing the commands
 **IMPORTANT RULES:**
 1. For rotation movements:
    - Use "mode": "rotate" with "direction": "left" or "right"
-   - Always specify a rotation value in degrees (default to 90 if not specified)
+   - Always specify a rotation value in degrees 
    - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
    - Use "stop_condition": "time" if time is specified, otherwise "rotation"
    1.2) for arc mode specify: turn radius and distance(distance of the arc)
@@ -138,11 +138,11 @@ Output: JSON object representing the commands
 
 For shapes, break them down into appropriate primitive movements:
 - Square: 4 forward movements with 90° right/left turns
-- Circle: A series of short arcs that form a complete 360° path
+- Circle: A arc that forms a complete 360° path
 - Triangle: 3 forward movements with 120° turns
 - Rectangle: 2 pairs of different-length forward movements with 90° turns
 - Figure-eight: Two connected circles in opposite directions
-
+-question mark figure(complrx shape example) : half circle then downwards line movement
 Always provide complete, valid JSON that a robot can execute immediately.
 """
 
