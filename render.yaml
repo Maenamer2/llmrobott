@@ -10,10 +10,7 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: DATABASE_URL
-        fromDatabase:
+        fromService:
+          type: database
           name: robot-db
           property: connectionString
-
-databases:
-  - name: robot-db
-    plan: free
