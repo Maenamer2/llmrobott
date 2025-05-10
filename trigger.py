@@ -1,4 +1,3 @@
-
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import openai
 import json
@@ -9,6 +8,8 @@ import logging
 import re
 from functools import wraps
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -36,9 +37,20 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
     role = db.Column(db.String(20), nullable=False, default='user')
-
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime, nullable=True)
+    failed_login_attempts = db.Column(db.Integer, default=0)
+    account_locked = db.Column(db.Boolean, default=False)
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+        
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+    
     def __repr__(self):
         return f'<User {self.username}>'
 
@@ -52,6 +64,33 @@ class CommandHistory(db.Model):
 
     def __repr__(self):
         return f'<CommandHistory {self.id}>'
+
+# Password validation function
+def validate_password(password):
+    """
+    Validates password strength based on multiple criteria.
+    Returns (is_valid, message) tuple.
+    """
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    
+    # Check for at least one uppercase letter
+    if not re.search(r'[A-Z]', password):
+        return False, "Password must contain at least one uppercase letter"
+    
+    # Check for at least one lowercase letter
+    if not re.search(r'[a-z]', password):
+        return False, "Password must contain at least one lowercase letter"
+    
+    # Check for at least one digit
+    if not re.search(r'\d', password):
+        return False, "Password must contain at least one number"
+    
+    # Check for at least one special character
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False, "Password must contain at least one special character"
+    
+    return True, "Password is strong"
 
 # Rate limiting configuration
 rate_limits = {
@@ -268,20 +307,51 @@ def interpret_command(command, previous_commands=None):
             "description": "Error in API communication"  # Removed sequence_type
         }
 
+# Database initialization
 with app.app_context():
     # Create all tables
     db.create_all()
     
-    # Create default users if they don't exist
-    if User.query.filter_by(username='maen').first() is None:
-        default_users = [
-            User(username='maen', password='maen', role='admin'),
-            User(username='user1', password='password1', role='user'),
-            User(username='robotics', password='securepass', role='user')
-        ]
-        db.session.add_all(default_users)
-        db.session.commit()
-        print("Default users created successfully")
+    # Check if default users exist
+    admin = User.query.filter_by(username='maen').first()
+    
+    if admin is None:
+        try:
+            # Create default admin user
+            admin_user = User(
+                username='maen', 
+                email='admin@example.com',  # Add a default email
+                role='admin', 
+                created_at=datetime.utcnow()
+            )
+            admin_user.set_password('maen')
+            
+            # Create default user1
+            user1 = User(
+                username='user1', 
+                email='user1@example.com',
+                role='user',
+                created_at=datetime.utcnow()
+            )
+            user1.set_password('password1')
+            
+            # Create default robotics user
+            robotics = User(
+                username='robotics', 
+                email='robotics@example.com',
+                role='user',
+                created_at=datetime.utcnow()
+            )
+            robotics.set_password('securepass')
+            
+            # Add all users to database
+            db.session.add_all([admin_user, user1, robotics])
+            db.session.commit()
+            
+            print("Default users created successfully")
+        except Exception as e:
+            db.session.rollback()
+            print(f"Error creating default users: {str(e)}")
     else:
         print("Default users already exist")
 
@@ -300,6 +370,8 @@ LOGIN_HTML = """
         button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
         button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
         .error { color: #f87171; margin-top: 10px; }
+        a { color: #38bdf8; text-decoration: none; }
+        a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -311,9 +383,407 @@ LOGIN_HTML = """
             <input type="password" name="password" placeholder="Password" required>
             <button type="submit">Login</button>
         </form>
+        <p>Don't have an account? <a href="/register">Register here</a></p>
         <p class="error" id="errorMsg" style="display: none;"></p>
     </div>
 </body>
+</html>
+"""
+
+# Registration form HTML
+REGISTER_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register - Robot Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; text-align: center; background-color: #1e293b; color: white; padding: 50px; }
+        .register-container { max-width: 500px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
+        input, button { padding: 15px; font-size: 16px; margin: 10px 0; border-radius: 10px; border: none; width: 100%; box-sizing: border-box; }
+        input { background-color: #475569; color: white; }
+        button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
+        button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
+        .error { color: #f87171; margin-top: 10px; }
+        .success { color: #4ade80; margin-top: 10px; }
+        .password-strength { text-align: left; margin: 5px 0 15px 0; font-size: 14px; }
+        .password-criteria { text-align: left; margin: 0; padding: 0 0 0 20px; font-size: 14px; color: #94a3b8; }
+        .password-criteria li { margin: 5px 0; }
+        .password-criteria li.met { color: #4ade80; }
+        a { color: #38bdf8; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        <h1>Robot Control</h1>
+        <h2>Create an Account</h2>
+        <form id="registerForm" action="/register" method="post">
+            <input type="text" name="username" id="username" placeholder="Username (3-20 characters)" required>
+            <input type="email" name="email" id="email" placeholder="Email Address" required>
+            <input type="password" name="password" id="password" placeholder="Password" required>
+            <div class="password-strength">
+                <div id="passwordStrengthBar" style="height: 5px; width: 0%; background-color: #ef4444; border-radius: 5px; transition: all 0.3s;"></div>
+                <ul class="password-criteria">
+                    <li id="length">At least 8 characters</li>
+                    <li id="uppercase">At least one uppercase letter</li>
+                    <li id="lowercase">At least one lowercase letter</li>
+                    <li id="number">At least one number</li>
+                    <li id="special">At least one special character (!@#$%^&*)</li>
+                </ul>
+            </div>
+            <input type="password" name="confirm_password" id="confirmPassword" placeholder="Confirm Password" required>
+            <button type="submit">Register</button>
+        </form>
+        <p class="error" id="errorMsg" style="display: none;"></p>
+        <p class="success" id="successMsg" style="display: none;"></p>
+        <p>Already have an account? <a href="/">Login here</a></p>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const passwordInput = document.getElementById('password');
+            const confirmPasswordInput = document.getElementById('confirmPassword');
+            const passwordStrengthBar = document.getElementById('passwordStrengthBar');
+            const form = document.getElementById('registerForm');
+            
+            // Password criteria elements
+            const lengthCriteria = document.getElementById('length');
+            const uppercaseCriteria = document.getElementById('uppercase');
+            const lowercaseCriteria = document.getElementById('lowercase');
+            const numberCriteria = document.getElementById('number');
+            const specialCriteria = document.getElementById('special');
+            
+            passwordInput.addEventListener('input', function() {
+                const password = passwordInput.value;
+                let strength = 0;
+                
+                // Reset all criteria
+                lengthCriteria.classList.remove('met');
+                uppercaseCriteria.classList.remove('met');
+                lowercaseCriteria.classList.remove('met');
+                numberCriteria.classList.remove('met');
+                specialCriteria.classList.remove('met');
+                
+                // Check each criteria
+                if (password.length >= 8) {
+                    strength += 20;
+                    lengthCriteria.classList.add('met');
+                }
+                
+                if (/[A-Z]/.test(password)) {
+                    strength += 20;
+                    uppercaseCriteria.classList.add('met');
+                }
+                
+                if (/[a-z]/.test(password)) {
+                    strength += 20;
+                    lowercaseCriteria.classList.add('met');
+                }
+                
+                if (/\d/.test(password)) {
+                    strength += 20;
+                    numberCriteria.classList.add('met');
+                }
+                
+                if (/[!@#$%^&*(),.?":{}|<>]/.test(password)) {
+                    strength += 20;
+                    specialCriteria.classList.add('met');
+                }
+                
+                // Update strength bar
+                passwordStrengthBar.style.width = strength + '%';
+                
+                // Change color based on strength
+                if (strength < 40) {
+                    passwordStrengthBar.style.backgroundColor = '#ef4444'; // red
+                } else if (strength < 80) {
+                    passwordStrengthBar.style.backgroundColor = '#eab308'; // yellow
+                } else {
+                    passwordStrengthBar.style.backgroundColor = '#4ade80'; // green
+                }
+            });
+            
+            form.addEventListener('submit', function(e) {
+                // Check if passwords match
+                if (passwordInput.value !== confirmPasswordInput.value) {
+                    e.preventDefault();
+                    document.getElementById('errorMsg').textContent = 'Passwords do not match';
+                    document.getElementById('errorMsg').style.display = 'block';
+                    document.getElementById('successMsg').style.display = 'none';
+                }
+            });
+        });
+    </script>
+</body>
+</html>
+"""
+
+# Registration success page
+REGISTRATION_SUCCESS_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Registration Successful - Robot Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; text-align: center; background-color: #1e293b; color: white; padding: 50px; }
+        .success-container { max-width: 500px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
+        .success-icon { font-size: 64px; color: #4ade80; margin: 20px 0; }
+        h1 { color: #4ade80; }
+        p { margin: 20px 0; line-height: 1.6; }
+        a { display: inline-block; margin-top: 20px; padding: 15px 30px; background-color: #0284c7; color: white; text-decoration: none; border-radius: 10px; transition: all 0.2s; }
+        a:hover { background-color: #0ea5e9; transform: translateY(-2px); }
+    </style>
+</head>
+<body>
+    <div class="success-container">
+        <div class="success-icon">✓</div>
+        <h1>Registration Successful!</h1>
+        <p>Your account has been created successfully. You can now log in to access the Robot Control interface.</p>
+        <a href="/">Login Now</a>
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/')
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('home'))
+    return LOGIN_HTML
+
+@app.route('/auth', methods=['POST'])
+def auth():
+    username = request.form.get('username', '')
+    password = request.form.get('password', '')
+
+    user = User.query.filter_by(username=username).first()
+    
+    # Check if account is locked
+    if user and user.account_locked:
+        error_html = LOGIN_HTML.replace(
+            '<p class="error" id="errorMsg" style="display: none;"></p>', 
+            '<p class="error" id="errorMsg">Account locked due to multiple failed login attempts. Please contact an administrator.</p>'
+        )
+        return error_html
+    
+    # Validate password
+    if user and user.check_password(password):
+        # Reset failed login attempts on successful login
+        user.failed_login_attempts = 0
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
+        session['user_id'] = user.id
+        session['username'] = user.username
+        return redirect(url_for('home'))
+    else:
+        # Increment failed login attempts
+        if user:
+            user.failed_login_attempts += 1
+            
+            # Lock account after 5 failed attempts
+            if user.failed_login_attempts >= 5:
+                user.account_locked = True
+                db.session.commit()
+                error_html = LOGIN_HTML.replace(
+                    '<p class="error" id="errorMsg" style="display: none;"></p>', 
+                    '<p class="error" id="errorMsg">Account locked due to multiple failed login attempts. Please contact an administrator.</p>'
+                )
+                return error_html
+            
+            db.session.commit()
+        
+        error_html = LOGIN_HTML.replace(
+            '<p class="error" id="errorMsg" style="display: none;"></p>', 
+            '<p class="error" id="errorMsg">Invalid credentials</p>'
+        )
+        return error_html
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    session.pop('username', None)
+    return redirect(url_for('login'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'GET':
+        return REGISTER_HTML
+    
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        
+        # Verify all fields are provided
+        if not (username and email and password and confirm_password):
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                '<p class="error" id="errorMsg">All fields are required</p>'
+            )
+            return error_html
+        
+        # Check username length
+        if len(username) < 3 or len(username) > 20:
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                '<p class="error" id="errorMsg">Username must be between 3 and 20 characters</p>'
+            )
+            return error_html
+        
+        # Check if username already exists
+        if User.query.filter_by(username=username).first():
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                '<p class="error" id="errorMsg">Username already taken</p>'
+            )
+            return error_html
+        
+        # Check if email already exists
+        if User.query.filter_by(email=email).first():
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                '<p class="error" id="errorMsg">Email already registered</p>'
+            )
+            return error_html
+        
+        # Validate password strength
+        is_valid, message = validate_password(password)
+        if not is_valid:
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                f'<p class="error" id="errorMsg">{message}</p>'
+            )
+            return error_html
+        
+        # Check if passwords match
+        if password != confirm_password:
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                '<p class="error" id="errorMsg">Passwords do not match</p>'
+            )
+            return error_html
+        
+        # Create new user
+        try:
+            new_user = User(username=username, email=email, role='user')
+            new_user.set_password(password)
+            db.session.add(new_user)
+            db.session.commit()
+            
+            # Log the successful registration
+            logger.info(f"New user registered: {username}")
+            
+            return REGISTRATION_SUCCESS_HTML
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error registering user: {str(e)}")
+            error_html = REGISTER_HTML.replace(
+                '<p class="error" id="errorMsg" style="display: none;"></p>',
+                f'<p class="error" id="errorMsg">Registration failed: {str(e)}</p>'
+            )
+            return error_html
+
+@app.route('/home')
+@login_required
+def home():
+    # Replace the username placeholder with the actual username
+    return ROBOT_INTERFACE_HTML.replace("{{ username }}", session['username'])
+
+@app.route('/send_command', methods=['POST'])
+@login_required
+@rate_limit
+def send_command():
+    try:
+        command = request.form.get('command', '').strip()
+        user_id = session.get('user_id')
+        
+        if not command:
+            return jsonify({"error": "No command provided"})
+        
+        # Get user command history for context (only command strings)
+        user_commands = []
+        recent_commands = CommandHistory.query.filter(
+            CommandHistory.user_id == user_id,
+            CommandHistory.is_time_record == False
+        ).order_by(CommandHistory.timestamp.desc()).limit(10).all()
+        
+        for cmd in recent_commands:
+            try:
+                cmd_data = json.loads(cmd.command)
+                if "original_command" in cmd_data:
+                    user_commands.append(cmd_data["original_command"])
+            except:
+                continue
+        
+        # Interpret the command
+        interpreted_command = interpret_command(command, user_commands)
+        
+        # Store command in history
+        new_command = CommandHistory(
+            user_id=user_id,
+            command=json.dumps(interpreted_command),
+            timestamp=time.time(),
+            is_time_record=False
+        )
+        db.session.add(new_command)
+        db.session.commit()
+        
+        # Return the interpreted command
+        return jsonify(interpreted_command)
+    
+    except Exception as e:
+        logger.error(f"Error processing command: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# New endpoint for ESP32 communication
+@app.route('/api/robot_command', methods=['GET', 'POST'])
+def robot_command():
+    # Simple authentication using API key instead of session-based auth
+    api_key = request.headers.get('X-API-Key')
+    if not api_key or api_key != '1234':
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    # For GET requests, return the latest command for the robot
+    if request.method == 'GET':
+        # Get robotics user ID
+        robotics_user = User.query.filter_by(username='robotics').first()
+        if not robotics_user:
+            return jsonify({"error": "Robotics user not found"}), 404
+            
+        # Get the most recent command
+        latest_command = CommandHistory.query.filter_by(
+            user_id=robotics_user.id,
+            is_time_record=False
+        ).order_by(CommandHistory.timestamp.desc()).first()
+        
+        if latest_command:
+            try:
+                return jsonify(json.loads(latest_command.command))
+            except:
+                return jsonify({"error": "Invalid command format"}), 500
+        else:
+            return jsonify({"error": "No commands available"}), 404
+    
+    # For POST requests, allow the ESP32 to send status updates
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            # Process status update from ESP32
+            logger.info(f"Received status update from ESP32: {data}")
+            
+            # Store the status update if needed - you could create another table for this
+            return jsonify({"status": "received"}), 200
+        except Exception as e:
+            logger.error(f"Error processing ESP32 status update: {str(e)}")
+            return jsonify({"error": str(e)}), 400
+
+if __name__ == '__main__':
+    # For development, otherwise use production WSGI server
+    app.run(debug=True, host='0.0.0.0', port=5000)
 </html>
 """
 
@@ -745,130 +1215,3 @@ ROBOT_INTERFACE_HTML = """
     });
     </script>
 </body>
-</html>
-"""
-
-@app.route('/')
-def login():
-    if 'user_id' in session:
-        return redirect(url_for('home'))
-    return LOGIN_HTML
-
-@app.route('/auth', methods=['POST'])
-def auth():
-    username = request.form.get('username', '')
-    password = request.form.get('password', '')
-
-    user = User.query.filter_by(username=username).first()
-    if user and user.password == password:  # In production, use proper password hashing!
-        session['user_id'] = user.id
-        session['username'] = user.username
-        return redirect(url_for('home'))
-    else:
-        error_html = LOGIN_HTML.replace('<p class="error" id="errorMsg" style="display: none;"></p>', 
-                                        '<p class="error" id="errorMsg">Invalid credentials</p>')
-        return error_html
-
-@app.route('/logout')
-def logout():
-    session.pop('user_id', None)
-    session.pop('username', None)
-    return redirect(url_for('login'))
-
-@app.route('/home')
-@login_required
-def home():
-    # Replace the username placeholder with the actual username
-    return ROBOT_INTERFACE_HTML.replace("{{ username }}", session['username'])
-
-@app.route('/send_command', methods=['POST'])
-@login_required
-@rate_limit
-def send_command():
-    try:
-        command = request.form.get('command', '').strip()
-        user_id = session.get('user_id')
-        
-        if not command:
-            return jsonify({"error": "No command provided"})
-        
-        # Get user command history for context (only command strings)
-        user_commands = []
-        recent_commands = CommandHistory.query.filter(
-            CommandHistory.user_id == user_id,
-            CommandHistory.is_time_record == False
-        ).order_by(CommandHistory.timestamp.desc()).limit(10).all()
-        
-        for cmd in recent_commands:
-            try:
-                cmd_data = json.loads(cmd.command)
-                if "original_command" in cmd_data:
-                    user_commands.append(cmd_data["original_command"])
-            except:
-                continue
-        
-        # Interpret the command
-        interpreted_command = interpret_command(command, user_commands)
-        
-        # Store command in history
-        new_command = CommandHistory(
-            user_id=user_id,
-            command=json.dumps(interpreted_command),
-            timestamp=time.time(),
-            is_time_record=False
-        )
-        db.session.add(new_command)
-        db.session.commit()
-        
-        # Return the interpreted command
-        return jsonify(interpreted_command)
-    
-    except Exception as e:
-        logger.error(f"Error processing command: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-# New endpoint for ESP32 communication
-@app.route('/api/robot_command', methods=['GET', 'POST'])
-def robot_command():
-    # Simple authentication using API key instead of session-based auth
-    api_key = request.headers.get('X-API-Key')
-    if not api_key or api_key != '1234':
-        return jsonify({"error": "Invalid API key"}), 401
-    
-    # For GET requests, return the latest command for the robot
-    if request.method == 'GET':
-        # Get robotics user ID
-        robotics_user = User.query.filter_by(username='robotics').first()
-        if not robotics_user:
-            return jsonify({"error": "Robotics user not found"}), 404
-            
-        # Get the most recent command
-        latest_command = CommandHistory.query.filter_by(
-            user_id=robotics_user.id,
-            is_time_record=False
-        ).order_by(CommandHistory.timestamp.desc()).first()
-        
-        if latest_command:
-            try:
-                return jsonify(json.loads(latest_command.command))
-            except:
-                return jsonify({"error": "Invalid command format"}), 500
-        else:
-            return jsonify({"error": "No commands available"}), 404
-    
-    # For POST requests, allow the ESP32 to send status updates
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
-            # Process status update from ESP32
-            logger.info(f"Received status update from ESP32: {data}")
-            
-            # Store the status update if needed - you could create another table for this
-            return jsonify({"status": "received"}), 200
-        except Exception as e:
-            logger.error(f"Error processing ESP32 status update: {str(e)}")
-            return jsonify({"error": str(e)}), 400
-
-if __name__ == '__main__':
-    # For development, otherwise use production WSGI server
-    app.run(debug=True, host='0.0.0.0', port=5000)
