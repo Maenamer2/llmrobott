@@ -6,10 +6,7 @@ import os
 import time
 import logging
 import re
-import hashlib
-import secrets
 from functools import wraps
-from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,25 +16,17 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "robotics_secret_key_2024")  # Better to use env variable on Render
-app.config['SESSION_COOKIE_SECURE'] = os.getenv("ENVIRONMENT", "development") == "production"
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=1)
+app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
 
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Enhanced data structure for users (in production, use a proper database)
+# Improved data structure for users (in production, use a proper database)
 USERS = {
-    "maen": {"password": "maen", "role": "admin", "salt": "", "created_at": datetime.now().isoformat()},
-    "user1": {"password": "password1", "role": "user", "salt": "", "created_at": datetime.now().isoformat()},
-    "robotics": {"password": "securepass", "role": "user", "salt": "", "created_at": datetime.now().isoformat()}
+    "maen": {"password": "maen", "role": "admin"},
+    "user1": {"password": "password1", "role": "user"},
+    "robotics": {"password": "securepass", "role": "user"}
 }
-
-# Track login attempts
-LOGIN_ATTEMPTS = {}  # {username: {"attempts": 0, "last_attempt": timestamp, "locked_until": timestamp}}
-MAX_LOGIN_ATTEMPTS = 5
-LOCKOUT_DURATION = 10 * 60  # 10 minutes in seconds
 
 # Command history for audit and improved responses
 command_history = {}
@@ -48,99 +37,12 @@ rate_limits = {
     "user": {"requests": 20, "period": 3600}    # 20 requests per hour
 }
 
-def hash_password(password, salt=None):
-    """
-    Hash a password with salt using SHA-256
-    """
-    if salt is None:
-        salt = secrets.token_hex(16)
-    
-    # Create a hash with the salt
-    pw_hash = hashlib.sha256((password + salt).encode()).hexdigest()
-    
-    return pw_hash, salt
-
-def check_password_policy(password):
-    """
-    Validate password meets security requirements
-    Returns (valid, message) tuple
-    """
-    if len(password) < 8:
-        return False, "Password must be at least 8 characters long"
-    
-    if not re.search(r'[A-Z]', password):
-        return False, "Password must contain at least one uppercase letter"
-    
-    if not re.search(r'[a-z]', password):
-        return False, "Password must contain at least one lowercase letter"
-    
-    if not re.search(r'[0-9]', password):
-        return False, "Password must contain at least one number"
-    
-    return True, "Password is valid"
-
-def check_login_attempts(username):
-    """
-    Check if account is locked due to too many failed login attempts
-    Returns (is_locked, message) tuple
-    """
-    now = time.time()
-    
-    if username not in LOGIN_ATTEMPTS:
-        LOGIN_ATTEMPTS[username] = {"attempts": 0, "last_attempt": now, "locked_until": None}
-        return False, ""
-    
-    # Check if account is locked
-    if LOGIN_ATTEMPTS[username].get("locked_until") and now < LOGIN_ATTEMPTS[username]["locked_until"]:
-        remaining = int(LOGIN_ATTEMPTS[username]["locked_until"] - now)
-        minutes = remaining // 60
-        seconds = remaining % 60
-        return True, f"Account temporarily locked. Try again in {minutes}m {seconds}s."
-    
-    # Reset lock if it has expired
-    if LOGIN_ATTEMPTS[username].get("locked_until") and now >= LOGIN_ATTEMPTS[username]["locked_until"]:
-        LOGIN_ATTEMPTS[username]["locked_until"] = None
-        LOGIN_ATTEMPTS[username]["attempts"] = 0
-    
-    return False, ""
-
-def record_failed_login(username):
-    """
-    Record a failed login attempt and lock account if too many attempts
-    """
-    now = time.time()
-    
-    if username not in LOGIN_ATTEMPTS:
-        LOGIN_ATTEMPTS[username] = {"attempts": 1, "last_attempt": now, "locked_until": None}
-    else:
-        # If last attempt was more than 24 hours ago, reset counter
-        if now - LOGIN_ATTEMPTS[username]["last_attempt"] > 24 * 3600:
-            LOGIN_ATTEMPTS[username]["attempts"] = 1
-        else:
-            LOGIN_ATTEMPTS[username]["attempts"] += 1
-        
-        LOGIN_ATTEMPTS[username]["last_attempt"] = now
-        
-        # Lock account if too many attempts
-        if LOGIN_ATTEMPTS[username]["attempts"] >= MAX_LOGIN_ATTEMPTS:
-            LOGIN_ATTEMPTS[username]["locked_until"] = now + LOCKOUT_DURATION
-            logger.warning(f"Account {username} locked due to too many failed login attempts")
-
-def reset_login_attempts(username):
-    """
-    Reset login attempts after successful login
-    """
-    if username in LOGIN_ATTEMPTS:
-        LOGIN_ATTEMPTS[username]["attempts"] = 0
-        LOGIN_ATTEMPTS[username]["locked_until"] = None
-
 # Decorator for authentication
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user' not in session:
-            # Return a redirect response instead of JSON for better user experience
-            return redirect(url_for('login_page'))
+            return jsonify({"error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return decorated_function
 
@@ -150,7 +52,7 @@ def rate_limit(f):
     def decorated_function(*args, **kwargs):
         user = session.get('user')
         if not user or user not in USERS:
-            return redirect(url_for('login'))
+            return jsonify({"error": "Authentication required"}), 401
         
         # Get user's role and corresponding rate limit
         role = USERS[user].get('role', 'user')
@@ -321,7 +223,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
             "description": "Error in API communication"  # Removed sequence_type
         }
 
-# HTML Templates - Updated with registration link and form
+# HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -336,15 +238,11 @@ LOGIN_HTML = """
         button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
         button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
         .error { color: #f87171; margin-top: 10px; }
-        .register-link { margin-top: 20px; color: #93c5fd; }
-        .register-link a { color: #60a5fa; text-decoration: none; }
-        .register-link a:hover { text-decoration: underline; }
-        .password-info { font-size: 12px; color: #94a3b8; text-align: left; margin-top: 5px; }
     </style>
 </head>
 <body>
     <div class="login-container">
-        <h1>Robot Control</h1>
+        <h1> Robot Control</h1>
         <h2>Login</h2>
         <form action="/auth" method="post">
             <input type="text" name="username" placeholder="Username" required>
@@ -352,47 +250,6 @@ LOGIN_HTML = """
             <button type="submit">Login</button>
         </form>
         <p class="error" id="errorMsg" style="display: none;"></p>
-        <p class="register-link">Don't have an account? <a href="/register">Register here</a></p>
-    </div>
-</body>
-</html>
-"""
-
-REGISTER_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Robot Control Registration</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; text-align: center; background-color: #1e293b; color: white; padding: 50px; }
-        .register-container { max-width: 400px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
-        input, button { padding: 15px; font-size: 16px; margin: 10px 0; border-radius: 10px; border: none; width: 100%; box-sizing: border-box; }
-        input { background-color: #475569; color: white; }
-        button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
-        button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
-        .error { color: #f87171; margin-top: 10px; }
-        .login-link { margin-top: 20px; color: #93c5fd; }
-        .login-link a { color: #60a5fa; text-decoration: none; }
-        .login-link a:hover { text-decoration: underline; }
-        .password-info { font-size: 12px; color: #94a3b8; text-align: left; margin: 5px 0 15px 0; }
-        .success { color: #34d399; margin-top: 10px; }
-    </style>
-</head>
-<body>
-    <div class="register-container">
-        <h1>Robot Control</h1>
-        <h2>Register</h2>
-        <form action="/register" method="post">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" id="password" placeholder="Password" required>
-            <p class="password-info">Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, and one number.</p>
-            <input type="password" name="confirm_password" placeholder="Confirm Password" required>
-            <button type="submit">Register</button>
-        </form>
-        <p class="error" id="errorMsg" style="display: none;"></p>
-        <p class="success" id="successMsg" style="display: none;"></p>
-        <p class="login-link">Already have an account? <a href="/">Login here</a></p>
     </div>
 </body>
 </html>
@@ -828,3 +685,125 @@ ROBOT_INTERFACE_HTML = """
 </body>
 </html>
 """
+
+@app.route('/')
+def login():
+    if 'user' in session:
+        return redirect(url_for('home'))
+    return LOGIN_HTML
+
+@app.route('/auth', methods=['POST'])
+def auth():
+    username = request.form.get('username', '')
+    password = request.form.get('password', '')
+
+    if username in USERS and USERS[username]["password"] == password:
+        session['user'] = username
+        return redirect(url_for('home'))
+    else:
+        error_html = LOGIN_HTML.replace('<p class="error" id="errorMsg" style="display: none;"></p>', 
+                                         '<p class="error" id="errorMsg">Invalid credentials</p>')
+        return error_html
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    return redirect(url_for('login'))
+
+@app.route('/home')
+@login_required
+def home():
+    # Replace the username placeholder with the actual username
+    return ROBOT_INTERFACE_HTML.replace("{{ username }}", session['user'])
+
+@app.route('/send_command', methods=['POST'])
+@login_required
+@rate_limit
+def send_command():
+    try:
+        command = request.form.get('command', '').strip()
+        user = session.get('user')
+        
+        if not command:
+            return jsonify({"error": "No command provided"})
+        
+        # Get user command history for context (only command strings)
+        user_commands = []
+        if user in command_history:
+            # Extract original commands from command objects
+            user_commands = [
+                item["original_command"] for item in command_history[user] 
+                if isinstance(item, dict) and "original_command" in item
+            ]
+        
+        # Interpret the command
+        interpreted_command = interpret_command(command, user_commands)
+        
+        # Store command in history
+        if user not in command_history:
+            command_history[user] = []
+        command_history[user].append(interpreted_command)
+        
+        # Limit command history to last 10 commands
+        if len(command_history[user]) > 10:
+            command_history[user] = command_history[user][-10:]
+        
+        # Return the interpreted command
+        return jsonify(interpreted_command)
+    
+    except Exception as e:
+        logger.error(f"Error processing command: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# New endpoint for ESP32 communication
+@app.route('/api/robot_command', methods=['GET', 'POST'])
+def robot_command():
+    # Simple authentication using API key instead of session-based auth
+    api_key = request.headers.get('X-API-Key')
+    if not api_key or api_key != '1234' :
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    # For GET requests, return the latest command for the robot
+    if request.method == 'GET':
+        # This could be the most recent command in your system
+        if 'robotics' in command_history and command_history['robotics']:
+            # Find the most recent valid command
+            for item in reversed(command_history['robotics']):
+                if isinstance(item, dict) and "commands" in item:
+                    return jsonify(item)
+            
+        return jsonify({"error": "No commands available"}), 404
+    
+    # For POST requests, allow the ESP32 to send status updates
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            # Process status update from ESP32
+            logger.info(f"Received status update from ESP32: {data}")
+            
+            # Store the status update if needed
+            if 'status' in data and 'commandId' in data:
+                status_update = {
+                    "timestamp": time.time(),
+                    "status": data['status'],
+                    "commandId": data['commandId']
+                }
+                
+                # You could store this in a database or in memory
+                if 'esp32_status' not in command_history:
+                    command_history['esp32_status'] = []
+                
+                command_history['esp32_status'].append(status_update)
+                
+                # Keep only the last 20 status updates
+                if len(command_history['esp32_status']) > 20:
+                    command_history['esp32_status'] = command_history['esp32_status'][-20:]
+            
+            return jsonify({"status": "received"}), 200
+        except Exception as e:
+            logger.error(f"Error processing ESP32 status update: {str(e)}")
+            return jsonify({"error": str(e)}), 400
+
+if __name__ == '__main__':
+    # For development, otherwise use production WSGI server
+    app.run(debug=True, host='0.0.0.0', port=5000)
