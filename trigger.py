@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 import openai
 import json
 from dotenv import load_dotenv
@@ -7,9 +7,6 @@ import time
 import logging
 import re
 from functools import wraps
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -21,43 +18,18 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
 
-# Database Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", "sqlite:///robot_control.db")
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+# Configure OpenAI
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# User Model
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    role = db.Column(db.String(20), default='user')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_login = db.Column(db.DateTime)
-    
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-        
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
+# Improved data structure for users (in production, use a proper database)
+USERS = {
+    "maen": {"password": "maen", "role": "admin"},
+    "user1": {"password": "password1", "role": "user"},
+    "robotics": {"password": "securepass", "role": "user"}
+}
 
-# Command History Model
-class CommandHistory(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    command = db.Column(db.Text, nullable=False)
-    processed_command = db.Column(db.Text)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    user = db.relationship('User', backref=db.backref('commands', lazy=True))
-
-# Rate Limit Model
-class RateLimit(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    request_time = db.Column(db.Float, nullable=False)
-    
-    user = db.relationship('User', backref=db.backref('rate_limits', lazy=True))
+# Command history for audit and improved responses
+command_history = {}
 
 # Rate limiting configuration
 rate_limits = {
@@ -65,14 +37,11 @@ rate_limits = {
     "user": {"requests": 20, "period": 3600}    # 20 requests per hour
 }
 
-# Configure OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
 # Decorator for authentication
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
+        if 'user' not in session:
             return jsonify({"error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return decorated_function
@@ -81,51 +50,32 @@ def login_required(f):
 def rate_limit(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
+        user = session.get('user')
+        if not user or user not in USERS:
             return jsonify({"error": "Authentication required"}), 401
         
-        user_id = session['user_id']
-        user = User.query.get(user_id)
-        
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-        
         # Get user's role and corresponding rate limit
-        role = user.role
+        role = USERS[user].get('role', 'user')
         limit = rate_limits.get(role, rate_limits['user'])
+        
+        # Initialize history if not exists
+        if user not in command_history:
+            command_history[user] = []
         
         # Clean up old requests
         current_time = time.time()
-        cutoff_time = current_time - limit['period']
-        
-        # Delete old rate limit records
-        db.session.query(RateLimit).filter(
-            RateLimit.user_id == user_id,
-            RateLimit.request_time < cutoff_time
-        ).delete()
-        
-        # Count recent requests
-        recent_request_count = RateLimit.query.filter(
-            RateLimit.user_id == user_id
-        ).count()
+        command_history[user] = [t for t in command_history[user] 
+                                 if isinstance(t, float) and current_time - t < limit['period']]
         
         # Check if limit exceeded
-        if recent_request_count >= limit['requests']:
-            oldest_request = RateLimit.query.filter(
-                RateLimit.user_id == user_id
-            ).order_by(RateLimit.request_time.asc()).first()
-            
-            retry_after = limit['period'] - (current_time - oldest_request.request_time)
-            
+        if len(command_history[user]) >= limit['requests']:
             return jsonify({
                 "error": f"Rate limit exceeded. Maximum {limit['requests']} requests per {limit['period']//3600} hour(s).",
-                "retry_after": retry_after
+                "retry_after": limit['period'] - (current_time - command_history[user][0])
             }), 429
         
         # Add current request timestamp
-        new_rate_limit = RateLimit(user_id=user_id, request_time=current_time)
-        db.session.add(new_rate_limit)
-        db.session.commit()
+        command_history[user].append(current_time)
         
         return f(*args, **kwargs)
     return decorated_function
@@ -273,34 +223,7 @@ Always provide complete, valid JSON that a robot can execute immediately.
             "description": "Error in API communication"  # Removed sequence_type
         }
 
-# Initialize database with admin user
-def initialize_database():
-    with app.app_context():
-        db.create_all()
-        
-        # Check if admin user exists
-        admin = User.query.filter_by(username='admin').first()
-        if not admin:
-            admin = User(username='admin', role='admin')
-            admin.set_password('admin')  # Should be changed in production!
-            db.session.add(admin)
-            
-            # Add the existing users
-            for username, data in {
-                "maen": {"password": "maen", "role": "admin"},
-                "user1": {"password": "password1", "role": "user"},
-                "robotics": {"password": "securepass", "role": "user"}
-            }.items():
-                if not User.query.filter_by(username=username).first():
-                    user = User(username=username, role=data["role"])
-                    user.set_password(data["password"])
-                    db.session.add(user)
-            
-            db.session.commit()
-            logger.info("Database initialized with default users")
-
-# HTML Templates 
-# (Updating the login form to include registration)
+# HTML Templates
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -315,169 +238,483 @@ LOGIN_HTML = """
         button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
         button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
         .error { color: #f87171; margin-top: 10px; }
-        .success { color: #10b981; margin-top: 10px; }
-        .tab-container { display: flex; margin-bottom: 20px; }
-        .tab { flex: 1; padding: 10px; cursor: pointer; border-bottom: 2px solid transparent; }
-        .tab.active { border-bottom-color: #0ea5e9; font-weight: bold; }
-        .form-container { display: none; }
-        .form-container.active { display: block; }
-        .footer { margin-top: 20px; font-size: 12px; color: #94a3b8; }
     </style>
 </head>
 <body>
     <div class="login-container">
-        <h1>Robot Control</h1>
-        
-        <div class="tab-container">
-            <div class="tab active" onclick="showTab('login')">Login</div>
-            <div class="tab" onclick="showTab('register')">Register</div>
-        </div>
-        
-        <div id="login-form" class="form-container active">
-            <h2>Login</h2>
-            <form action="/auth" method="post">
-                <input type="text" name="username" placeholder="Username" required>
-                <input type="password" name="password" placeholder="Password" required>
-                <button type="submit">Login</button>
+        <h1> Robot Control</h1>
+        <h2>Login</h2>
+        <form action="/auth" method="post">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Login</button>
+        </form>
+        <p class="error" id="errorMsg" style="display: none;"></p>
+    </div>
+</body>
+</html>
+"""
+
+ROBOT_INTERFACE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Robot Control Interface</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { 
+            font-family: 'Segoe UI', sans-serif; 
+            background-color: #0f172a; 
+            color: white; 
+            text-align: center; 
+            padding: 20px;
+            margin: 0;
+        }
+        .container {
+            max-width: 900px;
+            margin: auto;
+        }
+        .chatbox { 
+            background: #1e293b; 
+            padding: 30px; 
+            border-radius: 20px; 
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+            margin-bottom: 20px;
+        }
+        input[type="text"] { 
+            width: 80%; 
+            padding: 15px; 
+            font-size: 16px; 
+            border-radius: 12px; 
+            border: none; 
+            margin: 10px 0;
+            background-color: #334155;
+            color: white;
+        }
+        button { 
+            padding: 15px 20px; 
+            font-size: 16px; 
+            margin: 5px; 
+            border-radius: 12px; 
+            border: none; 
+            background-color: #0284c7; 
+            color: white; 
+            cursor: pointer; 
+            transition: all 0.2s ease;
+        }
+        button:hover { 
+            background-color: #0ea5e9; 
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .btn-speak {
+            background-color: #059669;
+        }
+        .btn-speak:hover {
+            background-color: #10b981;
+        }
+        pre { 
+            text-align: left; 
+            background: #0f172a; 
+            padding: 20px; 
+            border-radius: 12px; 
+            color: #f1f5f9; 
+            overflow-x: auto; 
+            margin-top: 20px; 
+            font-size: 14px;
+            white-space: pre-wrap;
+        }
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            background-color: #334155;
+            padding: 10px 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        #voiceStatus {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background-color: #475569;
+        }
+        #voiceStatus.listening {
+            background-color: #059669;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 0.7; }
+            50% { opacity: 1; }
+            100% { opacity: 0.7; }
+        }
+        .robot-container {
+            margin: 20px 0;
+            position: relative;
+        }
+        #robotFace {
+            width: 100px;
+            height: 100px;
+            background-color: #334155;
+            border-radius: 50%;
+            margin: 0 auto;
+            position: relative;
+            transition: all 0.5s ease;
+        }
+        #robotFace.active {
+            background-color: #0ea5e9;
+            box-shadow: 0 0 20px rgba(14, 165, 233, 0.7);
+        }
+        #robotFace.listening {
+            background-color: #10b981;
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.7);
+        }
+        #robotFace::before,
+        #robotFace::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background-color: #0f172a;
+            border-radius: 50%;
+            top: 30px;
+            transition: all 0.5s ease;
+        }
+        #robotFace::before {
+            left: 25px;
+        }
+        #robotFace::after {
+            right: 25px;
+        }
+        #robotFace.active::before,
+        #robotFace.active::after,
+        #robotFace.listening::before,
+        #robotFace.listening::after {
+            background-color: #ffffff;
+            width: 22px;
+            height: 22px;
+        }
+        .mouth {
+            position: absolute;
+            width: 40px;
+            height: 10px;
+            background-color: #0f172a;
+            bottom: 25px;
+            left: calc(50% - 20px);
+            border-radius: 10px;
+            transition: all 0.5s ease;
+        }
+        #robotFace.active .mouth,
+        #robotFace.listening .mouth {
+            background-color: #ffffff;
+            height: 15px;
+            width: 40px;
+            left: calc(50% - 20px);
+            border-radius: 0 0 20px 20px;
+        }
+        a.logout { 
+            display: inline-block; 
+            margin-top: 20px; 
+            color: #f87171; 
+            text-decoration: none; 
+            font-weight: bold;
+            transition: color 0.2s ease;
+        }
+        a.logout:hover {
+            color: #ef4444;
+        }
+        .command-examples {
+            text-align: left;
+            background-color: #334155;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        .command-examples h3 {
+            margin-top: 0;
+        }
+        .example {
+            margin: 5px 0;
+            cursor: pointer;
+            padding: 5px;
+            border-radius: 5px;
+        }
+        .example:hover {
+            background-color: #475569;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="chatbox">
+            <h1> Robot Control Interface</h1>
+            
+            <div class="status-bar">
+                <span>Status: <span id="voiceStatus">Initializing...</span></span>
+                <span>User: <strong>{{ username }}</strong></span>
+            </div>
+            
+            <div class="robot-container">
+                <div id="robotFace">
+                    <div class="mouth"></div>
+                </div>
+            </div>
+            
+            <form id="commandForm" method="POST" action="/send_command">
+                <input type="text" id="command" name="command" placeholder="Enter movement command or say 'Hey Robot'..." required>
+                <div>
+                    <button type="button" class="btn-speak" onclick="manualStartListening()"> Speak</button>
+                    <button type="submit">Send Command</button>
+                </div>
             </form>
-            <p class="error" id="loginError" style="display: none;">{{ login_error }}</p>
-        </div>
-        
-        <div id="register-form" class="form-container">
-            <h2>Create Account</h2>
-            <form action="/register" method="post">
-                <input type="text" name="username" placeholder="Username (3-20 characters)" required minlength="3" maxlength="20">
-                <input type="password" name="password" placeholder="Password (min 6 characters)" required minlength="6">
-                <input type="password" name="confirm_password" placeholder="Confirm Password" required>
-                <button type="submit">Register</button>
-            </form>
-            <p class="error" id="registerError" style="display: none;">{{ register_error }}</p>
-            <p class="success" id="registerSuccess" style="display: none;">{{ register_success }}</p>
-        </div>
-        
-        <div class="footer">
-            Robot Control System v2.0
+            
+            <div class="command-examples">
+                <h3>Try these commands:</h3>
+                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
+                    Do a square with 1.5 meter sides
+                </div>
+                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
+                    Go left for 3 seconds then go right quickly for 5 meters
+                </div>
+                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
+                    Draw a circle with an area of 20 meters
+                </div>
+                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
+                    make a star 
+                </div>
+            </div>
+            
+            <h2> Generated Robot Commands: <span id="responseStatus"></span></h2>
+            <pre id="response">No command sent yet.</pre>
+            
+            <a class="logout" href="/logout"> Logout</a>
         </div>
     </div>
-    
+
     <script>
-        function showTab(tabName) {
-            // Hide all tabs
-            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-            document.querySelectorAll('.form-container').forEach(form => form.classList.remove('active'));
+    // Speech Recognition Setup
+    let recognition = null;
+    const triggerPhrases = ["hey robot", "okay robot", "robot", "hey bot"];
+    let isListeningForTrigger = false;
+    let isListeningForCommand = false;
+    let commandTimeout = null;
+
+    function initSpeechRecognition() {
+        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+            alert("Speech recognition not supported. Try Chrome, Edge, or Safari.");
+            return;
+        }
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        
+        // Configure recognition
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+        
+        // Update UI to show status
+        function updateStatus(status) {
+            const statusElement = document.getElementById('voiceStatus');
+            const robotFace = document.getElementById('robotFace');
             
-            // Show selected tab
-            document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
-            document.getElementById(`${tabName}-form`).classList.add('active');
+            statusElement.textContent = status;
+            statusElement.className = status.includes('Listening') ? 'listening' : '';
+            
+            if (status.includes('Listening for trigger')) {
+                robotFace.className = '';
+            } else if (status.includes('Listening for command')) {
+                robotFace.className = 'listening';
+            } else if (status.includes('Processing')) {
+                robotFace.className = 'active';
+            }
         }
         
-        // Show errors if present
-        document.addEventListener('DOMContentLoaded', function() {
-            if ('{{ login_error }}') {
-                document.getElementById('loginError').style.display = 'block';
+        // Process speech results
+        recognition.onresult = function(event) {
+            const lastResult = event.results[event.results.length - 1];
+            const transcript = lastResult[0].transcript.trim().toLowerCase();
+            
+            console.log(` Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
+            
+            if (isListeningForTrigger) {
+                // Check for trigger phrases
+                if (triggerPhrases.some(phrase => transcript.includes(phrase))) {
+                    recognition.stop();
+                    updateStatus("Listening for command...");
+                    
+                    setTimeout(() => {
+                        isListeningForTrigger = false;
+                        isListeningForCommand = true;
+                        recognition.continuous = false;
+                        recognition.start();
+                        
+                        commandTimeout = setTimeout(() => {
+                            if (isListeningForCommand) {
+                                recognition.stop();
+                                resetToTriggerMode();
+                                updateStatus("No command heard. Try again.");
+                            }
+                        }, 5000);
+                    }, 300);
+                }
+            } 
+            else if (isListeningForCommand && !lastResult.isFinal) {
+                document.getElementById('command').value = transcript;
             }
-            if ('{{ register_error }}') {
-                document.getElementById('registerError').style.display = 'block';
-                showTab('register');
+            else if (isListeningForCommand && lastResult.isFinal) {
+                clearTimeout(commandTimeout);
+                document.getElementById('command').value = transcript;
+                
+                updateStatus("Processing command...");
+                document.getElementById('commandForm').requestSubmit();
+                resetToTriggerMode();
             }
-            if ('{{ register_success }}') {
-                document.getElementById('registerSuccess').style.display = 'block';
-                showTab('login');
+        };
+        
+        // Reset to trigger word listening mode
+        function resetToTriggerMode() {
+            isListeningForCommand = false;
+            isListeningForTrigger = true;
+            recognition.continuous = true;
+            updateStatus("Listening for trigger word...");
+            
+            setTimeout(() => {
+                try {
+                    recognition.start();
+                } catch (e) {
+                    console.log("Recognition restart error:", e);
+                }
+            }, 300);
+        }
+        
+        // Handle errors
+        recognition.onerror = function(event) {
+            console.log("⚠️ Speech recognition error:", event.error);
+            if (event.error === 'no-speech' || event.error === 'network') {
+                recognition.stop();
+                resetToTriggerMode();
+            } else {
+                updateStatus("Voice recognition error. Restarting...");
+                setTimeout(resetToTriggerMode, 2000);
             }
+        };
+        
+        // Handle end of recognition
+        recognition.onend = function() {
+            if (isListeningForTrigger) {
+                setTimeout(() => {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        console.log("Recognition start error:", e);
+                    }
+                }, 200);
+            }
+        };
+        
+        // Initial start
+        updateStatus("Listening for trigger word...");
+        try {
+            recognition.start();
+            isListeningForTrigger = true;
+        } catch (e) {
+            console.error("Failed to start speech recognition:", e);
+            updateStatus("Failed to start voice recognition");
+        }
+    }
+
+    function manualStartListening() {
+        if (!recognition) return;
+        
+        recognition.stop();
+        isListeningForTrigger = false;
+        isListeningForCommand = true;
+        document.getElementById('voiceStatus').textContent = "Listening for command...";
+        document.getElementById('robotFace').className = 'listening';
+        
+        commandTimeout = setTimeout(() => {
+            if (isListeningForCommand) {
+                recognition.stop();
+                resetToTriggerMode();
+                document.getElementById('voiceStatus').textContent = "No command heard. Try again.";
+            }
+        }, 5000);
+        
+        setTimeout(() => {
+            recognition.continuous = false;
+            recognition.start();
+        }, 200);
+    }
+
+    // Initialize speech recognition and form submission
+    document.addEventListener('DOMContentLoaded', function() {
+        initSpeechRecognition();
+        
+        document.getElementById('commandForm').addEventListener('submit', function(event) {
+            event.preventDefault();
+            let formData = new FormData(this);
+            
+            document.getElementById('responseStatus').textContent = "Processing...";
+            
+            fetch('/send_command', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                const output = JSON.stringify(data, null, 4);
+                document.getElementById('response').textContent = output;
+                document.getElementById('responseStatus').textContent = "Command received";
+            })
+            .catch(error => {
+                document.getElementById('response').textContent = "⚠️ Error: " + error.message;
+                document.getElementById('responseStatus').textContent = "Error";
+            });
         });
+    });
     </script>
 </body>
 </html>
 """
 
-# Keep the robot interface template as is, but update the logout link
-# (ROBOT_INTERFACE_HTML is unchanged since it's extensive - just update the session handling)
-
 @app.route('/')
 def login():
-    if 'user_id' in session:
+    if 'user' in session:
         return redirect(url_for('home'))
-    return LOGIN_HTML.replace('{{ login_error }}', '').replace('{{ register_error }}', '').replace('{{ register_success }}', '')
+    return LOGIN_HTML
 
 @app.route('/auth', methods=['POST'])
 def auth():
     username = request.form.get('username', '')
     password = request.form.get('password', '')
 
-    user = User.query.filter_by(username=username).first()
-    
-    if user and user.check_password(password):
-        session['user_id'] = user.id
-        session['username'] = user.username
-        
-        # Update last login time
-        user.last_login = datetime.utcnow()
-        db.session.commit()
-        
+    if username in USERS and USERS[username]["password"] == password:
+        session['user'] = username
         return redirect(url_for('home'))
     else:
-        error_html = LOGIN_HTML.replace('{{ login_error }}', 'Invalid username or password')
-        error_html = error_html.replace('{{ register_error }}', '').replace('{{ register_success }}', '')
+        error_html = LOGIN_HTML.replace('<p class="error" id="errorMsg" style="display: none;"></p>', 
+                                         '<p class="error" id="errorMsg">Invalid credentials</p>')
         return error_html
-
-@app.route('/register', methods=['POST'])
-def register():
-    username = request.form.get('username', '').strip()
-    password = request.form.get('password', '')
-    confirm_password = request.form.get('confirm_password', '')
-    
-    # Validate input
-    if not username or len(username) < 3 or len(username) > 20:
-        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Username must be 3-20 characters')
-        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
-        return error_html
-    
-    if not password or len(password) < 6:
-        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Password must be at least 6 characters')
-        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
-        return error_html
-        
-    if password != confirm_password:
-        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Passwords do not match')
-        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
-        return error_html
-    
-    # Check if username exists
-    if User.query.filter_by(username=username).first():
-        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Username already exists')
-        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
-        return error_html
-    
-    # Create new user
-    new_user = User(username=username, role='user')
-    new_user.set_password(password)
-    
-    db.session.add(new_user)
-    db.session.commit()
-    
-    success_html = LOGIN_HTML.replace('{{ register_success }}', 'Account created successfully! Please login.')
-    success_html = success_html.replace('{{ login_error }}', '').replace('{{ register_error }}', '')
-    return success_html
 
 @app.route('/logout')
 def logout():
-    session.pop('user_id', None)
-    session.pop('username', None)
+    session.pop('user', None)
     return redirect(url_for('login'))
 
 @app.route('/home')
 @login_required
 def home():
-    # Get the user's username
-    username = session.get('username', '')
-    user = User.query.filter_by(username=username).first()
-    
-    if not user:
-        session.clear()
-        return redirect(url_for('login'))
-    
     # Replace the username placeholder with the actual username
-    return ROBOT_INTERFACE_HTML.replace("{{ username }}", username)
+    return ROBOT_INTERFACE_HTML.replace("{{ username }}", session['user'])
 
 @app.route('/send_command', methods=['POST'])
 @login_required
@@ -485,36 +722,31 @@ def home():
 def send_command():
     try:
         command = request.form.get('command', '').strip()
-        user_id = session.get('user_id')
+        user = session.get('user')
         
         if not command:
             return jsonify({"error": "No command provided"})
         
-        user = User.query.get(user_id)
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-        
-        # Get user command history for context
+        # Get user command history for context (only command strings)
         user_commands = []
-        previous_commands = CommandHistory.query.filter_by(user_id=user_id).order_by(
-            CommandHistory.timestamp.desc()
-        ).limit(10).all()
-        
-        for cmd in previous_commands:
-            if cmd.command:
-                user_commands.append(cmd.command)
+        if user in command_history:
+            # Extract original commands from command objects
+            user_commands = [
+                item["original_command"] for item in command_history[user] 
+                if isinstance(item, dict) and "original_command" in item
+            ]
         
         # Interpret the command
         interpreted_command = interpret_command(command, user_commands)
         
         # Store command in history
-        new_command = CommandHistory(
-            user_id=user_id,
-            command=command,
-            processed_command=json.dumps(interpreted_command)
-        )
-        db.session.add(new_command)
-        db.session.commit()
+        if user not in command_history:
+            command_history[user] = []
+        command_history[user].append(interpreted_command)
+        
+        # Limit command history to last 10 commands
+        if len(command_history[user]) > 10:
+            command_history[user] = command_history[user][-10:]
         
         # Return the interpreted command
         return jsonify(interpreted_command)
@@ -522,93 +754,6 @@ def send_command():
     except Exception as e:
         logger.error(f"Error processing command: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-# Admin dashboard to manage users
-@app.route('/admin')
-@login_required
-def admin_dashboard():
-    # Check if user is admin
-    user_id = session.get('user_id')
-    user = User.query.get(user_id)
-    
-    if not user or user.role != 'admin':
-        return jsonify({"error": "Unauthorized access"}), 403
-    
-    # Get all users (except current admin)
-    users = User.query.filter(User.id != user_id).all()
-    
-    # HTML for admin dashboard
-    admin_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Admin Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body {{ font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; padding: 20px; }}
-            .container {{ max-width: 1000px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }}
-            h1, h2 {{ margin-top: 0; }}
-            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #475569; }}
-            th {{ background-color: #0f172a; }}
-            tr:hover {{ background-color: #475569; }}
-            .action-btn {{ padding: 8px 12px; margin: 0 5px; border-radius: 8px; border: none; cursor: pointer; }}
-            .edit-btn {{ background-color: #0ea5e9; color: white; }}
-            .delete-btn {{ background-color: #ef4444; color: white; }}
-            .back-btn {{ display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #475569; color: white; text-decoration: none; border-radius: 8px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Admin Dashboard</h1>
-            <h2>User Management</h2>
-            
-            <table>
-                <tr>
-                    <th>Username</th>
-                    <th>Role</th>
-                    <th>Created</th>
-                    <th>Last Login</th>
-                    <th>Actions</th>
-                </tr>
-    """
-    
-    for u in users:
-        created_date = u.created_at.strftime('%Y-%m-%d') if u.created_at else 'N/A'
-        last_login = u.last_login.strftime('%Y-%m-%d %H:%M') if u.last_login else 'Never'
-        
-        admin_html += f"""
-                <tr>
-                    <td>{u.username}</td>
-                    <td>{u.role}</td>
-                    <td>{created_date}</td>
-                    <td>{last_login}</td>
-                    <td>
-                        <button class="action-btn edit-btn" onclick="location.href='/admin/edit_user/{u.id}'">Edit</button>
-                        <button class="action-btn delete-btn" onclick="confirmDelete({u.id}, '{u.username}')">Delete</button>
-                    </td>
-                </tr>
-        """
-    
-    admin_html += f"""
-            </table>
-            
-            <button class="action-btn edit-btn" onclick="location.href='/admin/add_user'">Add New User</button>
-            <a href="/home" class="back-btn">Back to Robot Control</a>
-        </div>
-        
-        <script>
-            function confirmDelete(userId, username) {{
-                if (confirm(`Are you sure you want to delete user: ${{username}}?`)) {{
-                    location.href = `/admin/delete_user/${{userId}}`;
-                }}
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    
-    return admin_html
 
 # New endpoint for ESP32 communication
 @app.route('/api/robot_command', methods=['GET', 'POST'])
@@ -620,22 +765,12 @@ def robot_command():
     
     # For GET requests, return the latest command for the robot
     if request.method == 'GET':
-        # Find the robotics user
-        robotics_user = User.query.filter_by(username='robotics').first()
-        
-        if not robotics_user:
-            return jsonify({"error": "Robotics user not found"}), 404
-        
-        # Get the most recent command
-        latest_command = CommandHistory.query.filter_by(user_id=robotics_user.id).order_by(
-            CommandHistory.timestamp.desc()
-        ).first()
-        
-        if latest_command and latest_command.processed_command:
-            try:
-                return jsonify(json.loads(latest_command.processed_command))
-            except:
-                pass
+        # This could be the most recent command in your system
+        if 'robotics' in command_history and command_history['robotics']:
+            # Find the most recent valid command
+            for item in reversed(command_history['robotics']):
+                if isinstance(item, dict) and "commands" in item:
+                    return jsonify(item)
             
         return jsonify({"error": "No commands available"}), 404
     
@@ -646,249 +781,29 @@ def robot_command():
             # Process status update from ESP32
             logger.info(f"Received status update from ESP32: {data}")
             
-            # Here you could store status updates in a database table
-            # For now, just log it
+            # Store the status update if needed
+            if 'status' in data and 'commandId' in data:
+                status_update = {
+                    "timestamp": time.time(),
+                    "status": data['status'],
+                    "commandId": data['commandId']
+                }
+                
+                # You could store this in a database or in memory
+                if 'esp32_status' not in command_history:
+                    command_history['esp32_status'] = []
+                
+                command_history['esp32_status'].append(status_update)
+                
+                # Keep only the last 20 status updates
+                if len(command_history['esp32_status']) > 20:
+                    command_history['esp32_status'] = command_history['esp32_status'][-20:]
             
             return jsonify({"status": "received"}), 200
         except Exception as e:
             logger.error(f"Error processing ESP32 status update: {str(e)}")
             return jsonify({"error": str(e)}), 400
 
-# Initialize the database if this file is run directly
 if __name__ == '__main__':
-    initialize_database()
     # For development, otherwise use production WSGI server
     app.run(debug=True, host='0.0.0.0', port=5000)
-
-# Additional admin routes for user management
-@app.route('/admin/add_user', methods=['GET', 'POST'])
-@login_required
-def add_user():
-    # Check if user is admin
-    user_id = session.get('user_id')
-    user = User.query.get(user_id)
-    
-    if not user or user.role != 'admin':
-        return jsonify({"error": "Unauthorized access"}), 403
-    
-    if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
-        role = request.form.get('role', 'user')
-        
-        # Validate input
-        if not username or len(username) < 3:
-            return render_template_string(ADD_USER_HTML, error="Username must be at least 3 characters")
-        
-        if not password or len(password) < 6:
-            return render_template_string(ADD_USER_HTML, error="Password must be at least 6 characters")
-        
-        # Check if username exists
-        if User.query.filter_by(username=username).first():
-            return render_template_string(ADD_USER_HTML, error="Username already exists")
-        
-        # Create new user
-        new_user = User(username=username, role=role)
-        new_user.set_password(password)
-        
-        db.session.add(new_user)
-        db.session.commit()
-        
-        return redirect(url_for('admin_dashboard'))
-    
-    # GET request - show the form
-    return render_template_string(ADD_USER_HTML, error=None)
-
-@app.route('/admin/edit_user/<int:user_id>', methods=['GET', 'POST'])
-@login_required
-def edit_user(user_id):
-    # Check if current user is admin
-    admin_id = session.get('user_id')
-    admin = User.query.get(admin_id)
-    
-    if not admin or admin.role != 'admin':
-        return jsonify({"error": "Unauthorized access"}), 403
-    
-    # Get the user to edit
-    user_to_edit = User.query.get(user_id)
-    if not user_to_edit:
-        return redirect(url_for('admin_dashboard'))
-    
-    if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        new_password = request.form.get('password', '')
-        role = request.form.get('role', 'user')
-        
-        # Validate username
-        if not username or len(username) < 3:
-            return render_template_string(
-                EDIT_USER_HTML, 
-                user=user_to_edit,
-                error="Username must be at least 3 characters"
-            )
-        
-        # Check if new username already exists (if changed)
-        if username != user_to_edit.username and User.query.filter_by(username=username).first():
-            return render_template_string(
-                EDIT_USER_HTML, 
-                user=user_to_edit,
-                error="Username already exists"
-            )
-        
-        # Update user
-        user_to_edit.username = username
-        user_to_edit.role = role
-        
-        # Update password if provided
-        if new_password:
-            if len(new_password) < 6:
-                return render_template_string(
-                    EDIT_USER_HTML, 
-                    user=user_to_edit,
-                    error="Password must be at least 6 characters"
-                )
-            user_to_edit.set_password(new_password)
-        
-        db.session.commit()
-        return redirect(url_for('admin_dashboard'))
-    
-    # GET request - show the form
-    return render_template_string(EDIT_USER_HTML, user=user_to_edit, error=None)
-
-@app.route('/admin/delete_user/<int:user_id>')
-@login_required
-def delete_user(user_id):
-    # Check if current user is admin
-    admin_id = session.get('user_id')
-    admin = User.query.get(admin_id)
-    
-    if not admin or admin.role != 'admin':
-        return jsonify({"error": "Unauthorized access"}), 403
-    
-    # Prevent self-deletion
-    if admin_id == user_id:
-        return redirect(url_for('admin_dashboard'))
-    
-    # Get the user to delete
-    user_to_delete = User.query.get(user_id)
-    if user_to_delete:
-        # Delete associated data
-        CommandHistory.query.filter_by(user_id=user_id).delete()
-        RateLimit.query.filter_by(user_id=user_id).delete()
-        
-        # Delete the user
-        db.session.delete(user_to_delete)
-        db.session.commit()
-    
-    return redirect(url_for('admin_dashboard'))
-
-# HTML Templates for user management
-ADD_USER_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Add New User</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; padding: 20px; }
-        .container { max-width: 500px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
-        h1 { margin-top: 0; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; }
-        input, select { width: 100%; padding: 10px; font-size: 16px; border-radius: 8px; border: none; background-color: #475569; color: white; }
-        button { padding: 12px 20px; margin-top: 10px; background-color: #0ea5e9; color: white; border: none; border-radius: 8px; cursor: pointer; }
-        .error { color: #f87171; margin-top: 10px; }
-        .back-btn { display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #475569; color: white; text-decoration: none; border-radius: 8px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Add New User</h1>
-        
-        {% if error %}
-        <p class="error">{{ error }}</p>
-        {% endif %}
-        
-        <form method="post">
-            <div class="form-group">
-                <label for="username">Username:</label>
-                <input type="text" id="username" name="username" required minlength="3">
-            </div>
-            
-            <div class="form-group">
-                <label for="password">Password:</label>
-                <input type="password" id="password" name="password" required minlength="6">
-            </div>
-            
-            <div class="form-group">
-                <label for="role">Role:</label>
-                <select id="role" name="role">
-                    <option value="user">User</option>
-                    <option value="admin">Admin</option>
-                </select>
-            </div>
-            
-            <button type="submit">Add User</button>
-        </form>
-        
-        <a href="/admin" class="back-btn">Back to Admin Dashboard</a>
-    </div>
-</body>
-</html>
-"""
-
-EDIT_USER_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Edit User</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; padding: 20px; }
-        .container { max-width: 500px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
-        h1 { margin-top: 0; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; }
-        input, select { width: 100%; padding: 10px; font-size: 16px; border-radius: 8px; border: none; background-color: #475569; color: white; }
-        button { padding: 12px 20px; margin-top: 10px; background-color: #0ea5e9; color: white; border: none; border-radius: 8px; cursor: pointer; }
-        .error { color: #f87171; margin-top: 10px; }
-        .note { color: #94a3b8; margin-top: 5px; font-size: 14px; }
-        .back-btn { display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #475569; color: white; text-decoration: none; border-radius: 8px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Edit User</h1>
-        
-        {% if error %}
-        <p class="error">{{ error }}</p>
-        {% endif %}
-        
-        <form method="post">
-            <div class="form-group">
-                <label for="username">Username:</label>
-                <input type="text" id="username" name="username" value="{{ user.username }}" required minlength="3">
-            </div>
-            
-            <div class="form-group">
-                <label for="password">New Password:</label>
-                <input type="password" id="password" name="password">
-                <p class="note">Leave blank to keep current password</p>
-            </div>
-            
-            <div class="form-group">
-                <label for="role">Role:</label>
-                <select id="role" name="role">
-                    <option value="user" {% if user.role == 'user' %}selected{% endif %}>User</option>
-                    <option value="admin" {% if user.role == 'admin' %}selected{% endif %}>Admin</option>
-                </select>
-            </div>
-            
-            <button type="submit">Update User</button>
-        </form>
-        
-        <a href="/admin" class="back-btn">Back to Admin Dashboard</a>
-    </div>
-</body>
-</html>
-"""
