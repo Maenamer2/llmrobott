@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash
 import openai
 import json
 from dotenv import load_dotenv
@@ -19,84 +19,54 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")
+app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env variable on Render
 
-# Configure PostgreSQL
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+# Database Configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL", "sqlite:///robot_control.db")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Configure OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# Define User model
+# User Model
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=True)  # Made nullable to handle existing records
+    username = db.Column(db.String(50), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
-    role = db.Column(db.String(20), nullable=False, default='user')
-    created_at = db.Column(db.DateTime, nullable=True)  # Made nullable to handle existing records
-    last_login = db.Column(db.DateTime, nullable=True)
-    failed_login_attempts = db.Column(db.Integer, default=0)
-    account_locked = db.Column(db.Boolean, default=False)
+    role = db.Column(db.String(20), default='user')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
     
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
         
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
-    
-    def __repr__(self):
-        return f'<User {self.username}>'
 
-# Define CommandHistory model
+# Command History Model
 class CommandHistory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     command = db.Column(db.Text, nullable=False)
-    timestamp = db.Column(db.Float, nullable=False)
-    is_time_record = db.Column(db.Boolean, default=False)
+    processed_command = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    user = db.relationship('User', backref=db.backref('commands', lazy=True))
 
-    def __repr__(self):
-        return f'<CommandHistory {self.id}>'
-
-# Password validation function
-def validate_password(password):
-    """
-    Validates password strength based on multiple criteria.
-    Returns (is_valid, message) tuple.
-    """
-    if len(password) < 8:
-        return False, "Password must be at least 8 characters long"
+# Rate Limit Model
+class RateLimit(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    request_time = db.Column(db.Float, nullable=False)
     
-    # Check for at least one uppercase letter
-    if not re.search(r'[A-Z]', password):
-        return False, "Password must contain at least one uppercase letter"
-    
-    # Check for at least one lowercase letter
-    if not re.search(r'[a-z]', password):
-        return False, "Password must contain at least one lowercase letter"
-    
-    # Check for at least one digit
-    if not re.search(r'\d', password):
-        return False, "Password must contain at least one number"
-    
-    # Check for at least one special character
-    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
-        return False, "Password must contain at least one special character"
-    
-    return True, "Password is strong"
+    user = db.relationship('User', backref=db.backref('rate_limits', lazy=True))
 
 # Rate limiting configuration
 rate_limits = {
     "admin": {"requests": 50, "period": 3600},  # 50 requests per hour
     "user": {"requests": 20, "period": 3600}    # 20 requests per hour
 }
+
+# Configure OpenAI
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Decorator for authentication
 def login_required(f):
@@ -118,32 +88,34 @@ def rate_limit(f):
         user = User.query.get(user_id)
         
         if not user:
-            return jsonify({"error": "User not found"}), 401
+            return jsonify({"error": "User not found"}), 404
         
         # Get user's role and corresponding rate limit
         role = user.role
         limit = rate_limits.get(role, rate_limits['user'])
         
-        # Get recent command time records
+        # Clean up old requests
         current_time = time.time()
         cutoff_time = current_time - limit['period']
         
-        # Count recent requests within the time period
-        recent_requests = CommandHistory.query.filter(
-            CommandHistory.user_id == user_id,
-            CommandHistory.is_time_record == True,
-            CommandHistory.timestamp > cutoff_time
+        # Delete old rate limit records
+        db.session.query(RateLimit).filter(
+            RateLimit.user_id == user_id,
+            RateLimit.request_time < cutoff_time
+        ).delete()
+        
+        # Count recent requests
+        recent_request_count = RateLimit.query.filter(
+            RateLimit.user_id == user_id
         ).count()
         
         # Check if limit exceeded
-        if recent_requests >= limit['requests']:
-            oldest_request = CommandHistory.query.filter(
-                CommandHistory.user_id == user_id,
-                CommandHistory.is_time_record == True,
-                CommandHistory.timestamp > cutoff_time
-            ).order_by(CommandHistory.timestamp.asc()).first()
+        if recent_request_count >= limit['requests']:
+            oldest_request = RateLimit.query.filter(
+                RateLimit.user_id == user_id
+            ).order_by(RateLimit.request_time.asc()).first()
             
-            retry_after = limit['period'] - (current_time - oldest_request.timestamp)
+            retry_after = limit['period'] - (current_time - oldest_request.request_time)
             
             return jsonify({
                 "error": f"Rate limit exceeded. Maximum {limit['requests']} requests per {limit['period']//3600} hour(s).",
@@ -151,13 +123,8 @@ def rate_limit(f):
             }), 429
         
         # Add current request timestamp
-        new_time_record = CommandHistory(
-            user_id=user_id,
-            command="TIME_RECORD",
-            timestamp=current_time,
-            is_time_record=True
-        )
-        db.session.add(new_time_record)
+        new_rate_limit = RateLimit(user_id=user_id, request_time=current_time)
+        db.session.add(new_rate_limit)
         db.session.commit()
         
         return f(*args, **kwargs)
@@ -171,63 +138,62 @@ def interpret_command(command, previous_commands=None):
     # Define a more detailed system prompt with improved prompt engineering
     system_prompt = """You are an AI that converts natural language movement instructions into structured JSON commands for a 4-wheeled robot.
 
-    You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
+You MUST ONLY output valid JSON. No explanations, text, or markdown formatting.
 
-    Input: Natural language instructions for robot movement
-    Output: JSON object representing the commands
+Input: Natural language instructions for robot movement
+Output: JSON object representing the commands
 
-    **Supported Movements:**
-    - Linear motion: Use "mode": "linear" with "direction": "forward" or "backward", with speed (m/s) and either distance (m) or time (s)
-    - Rotation: Use "mode": "rotate" with "direction": "left" or "right", with degrees and speed
-    - Arc movements: Use "mode": "arc" for curved paths with specified radius and direction
-    - Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
-    - Sequential movements: Multiple commands in sequence
+**Supported Movements:**
+- Linear motion: Use "mode": "linear" with "direction": "forward" or "backward", with speed (m/s) and either distance (m) or time (s)
+- Rotation: Use "mode": "rotate" with "direction": "left" or "right", with degrees and speed
+- Arc movements: Use "mode": "arc" for curved paths with specified radius and direction
+- Complex shapes: "square", "circle", "triangle", "rectangle", "spiral", "figure-eight"
+- Sequential movements: Multiple commands in sequence
 
-    **Output Format:**
+**Output Format:**
+{
+  "commands": [
     {
-      "commands": [
-        {
-          "mode": "linear|rotate|arc|stop",
-          "direction": "forward|backward|left|right",
-          "speed": float,  // meters per second (0.1-2.0)
-          "distance": float,  // meters (if applicable)
-          "time": float,  // seconds (if applicable)
-          "rotation": float,  // degrees (if applicable)
-          "turn_radius": float,  // meters (for arc movements)
-          "stop_condition": "time|distance|obstacle"  // when to stop
-        },
-        // Additional commands for sequences
-      ],
-      "description": "Brief human-readable description of what the robot will do"
-    }
+      "mode": "linear|rotate|arc|stop",
+      "direction": "forward|backward|left|right",
+      "speed": float,  // meters per second (0.1-2.0)
+      "distance": float,  // meters (if applicable)
+      "time": float,  // seconds (if applicable)
+      "rotation": float,  // degrees (if applicable)
+      "turn_radius": float,  // meters (for arc movements)
+      "stop_condition": "time|distance|obstacle"  // when to stop
+    },
+    // Additional commands for sequences
+  ],
+  "description": "Brief human-readable description of what the robot will do"
+}
 
-    **IMPORTANT RULES:**
-    1. For rotation movements:
-       - Use "mode": "rotate" with "direction": "left" or "right"
-       - Always specify a rotation value in degrees 
-       - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
-       - Use "stop_condition": "time" if time is specified, otherwise "rotation"
-       1.2) for arc mode specify: turn radius and distance(distance of the arc)
+**IMPORTANT RULES:**
+1. For rotation movements:
+   - Use "mode": "rotate" with "direction": "left" or "right"
+   - Always specify a rotation value in degrees (default to 90 if not specified)
+   - Always specify a reasonable speed (0.5-1.0 m/s is typical for rotation)
+   - Use "stop_condition": "time" if time is specified, otherwise "rotation"
 
-    2. For linear movements:
-       - Use "mode": "linear" with "direction": "forward" or "backward"
-       - Never use "left" or "right" as direction for linear movements
-       - For "go right" type instructions, interpret as "rotate right, then go forward"
-       - For "go left quickly for 5 meters", interpret as "rotate left, then go forward for 5 meters"
+2. For linear movements:
+   - Use "mode": "linear" with "direction": "forward" or "backward"
+   - Never use "left" or "right" as direction for linear movements
+   - For "go right" type instructions, interpret as "rotate right, then go forward"
+   - For "go left quickly for 5 meters", interpret as "rotate left, then go forward for 5 meters"
 
-    3. For sequences:
-       - Break each logical movement into its own command object
-       - Make sure speeds match descriptions (e.g., "quickly" = 1.5-2.0 m/s, "slowly" = 0.3-0.7 m/s)
+3. For sequences:
+   - Break each logical movement into its own command object
+   - Make sure speeds match descriptions (e.g., "quickly" = 1.5-2.0 m/s, "slowly" = 0.3-0.7 m/s)
 
-    For shapes, break them down into appropriate primitive movements:
-    - Square: 4 forward movements with 90° right/left turns
-    - Circle: A arc that forms a complete 360° path
-    - Triangle: 3 forward movements with 120° turns
-    - Rectangle: 2 pairs of different-length forward movements with 90° turns
-    - Figure-eight: Two connected circles in opposite directions
-    -question mark figure(complrx shape example) : half circle then downwards line movement
-    Always provide complete, valid JSON that a robot can execute immediately.
-    """
+For shapes, break them down into appropriate primitive movements:
+- Square: 4 forward movements with 90° right/left turns
+- Circle: A series of short arcs that form a complete 360° path
+- Triangle: 3 forward movements with 120° turns
+- Rectangle: 2 pairs of different-length forward movements with 90° turns
+- Figure-eight: Two connected circles in opposite directions
+
+Always provide complete, valid JSON that a robot can execute immediately.
+"""
 
     # User prompt with context
     user_prompt = f"Convert this command into a structured robot command: \"{command}\""
@@ -307,296 +273,35 @@ def interpret_command(command, previous_commands=None):
             "description": "Error in API communication"  # Removed sequence_type
         }
 
-# Database migration function to add new columns safely
-def add_column_if_not_exists(engine, table_name, column_name, column_type):
-    """Add a column to a table if it doesn't exist already."""
-    column_exists = False
-    
-    # Check if column already exists
-    inspector = db.inspect(engine)
-    columns = [col['name'] for col in inspector.get_columns(table_name)]
-    column_exists = column_name in columns
-    
-    if not column_exists:
-        # Column doesn't exist, add it
-        try:
-            logger.info(f"Adding column {column_name} to table {table_name}")
-            with engine.connect() as conn:
-                conn.execute(db.text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
-                conn.commit()
-            logger.info(f"Column {column_name} added successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Error adding column {column_name}: {e}")
-            return False
-    else:
-        logger.info(f"Column {column_name} already exists in {table_name}")
-        return True
-
-# Database initialization and migration
-with app.app_context():
-    # Create all tables first (for new tables)
-    db.create_all()
-    
-    # Get database engine
-    engine = db.engine
-    
-    # Add new columns to User table if they don't exist
-    add_column_if_not_exists(engine, 'user', 'email', 'VARCHAR(120) DEFAULT NULL')
-    add_column_if_not_exists(engine, 'user', 'created_at', 'TIMESTAMP DEFAULT NOW()')
-    add_column_if_not_exists(engine, 'user', 'last_login', 'TIMESTAMP DEFAULT NULL')
-    add_column_if_not_exists(engine, 'user', 'failed_login_attempts', 'INTEGER DEFAULT 0')
-    add_column_if_not_exists(engine, 'user', 'account_locked', 'BOOLEAN DEFAULT FALSE')
-    
-    # Make email column unique if it exists
-    try:
-        with engine.connect() as conn:
-            # This SQL is PostgreSQL specific
-            conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS ix_user_email_unique ON \"user\" (email) WHERE email IS NOT NULL"))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"Error making email column unique: {e}")
-    
-    # Now check for admin user and update/create if needed
-    admin = User.query.filter_by(username='maen').first()
-    
-    if admin is None:
-        try:
-            # Create default admin user
-            admin_user = User(
-                username='maen', 
-                email='admin@example.com',  # Add a default email
-                role='admin', 
-                created_at=datetime.utcnow()
-            )
-            admin_user.set_password('maen')
+# Initialize database with admin user
+def initialize_database():
+    with app.app_context():
+        db.create_all()
+        
+        # Check if admin user exists
+        admin = User.query.filter_by(username='admin').first()
+        if not admin:
+            admin = User(username='admin', role='admin')
+            admin.set_password('admin')  # Should be changed in production!
+            db.session.add(admin)
             
-            # Create default user1
-            user1 = User(
-                username='user1', 
-                email='user1@example.com',
-                role='user',
-                created_at=datetime.utcnow()
-            )
-            user1.set_password('password1')
+            # Add the existing users
+            for username, data in {
+                "maen": {"password": "maen", "role": "admin"},
+                "user1": {"password": "password1", "role": "user"},
+                "robotics": {"password": "securepass", "role": "user"}
+            }.items():
+                if not User.query.filter_by(username=username).first():
+                    user = User(username=username, role=data["role"])
+                    user.set_password(data["password"])
+                    db.session.add(user)
             
-            # Create default robotics user
-            robotics = User(
-                username='robotics', 
-                email='robotics@example.com',
-                role='user',
-                created_at=datetime.utcnow()
-            )
-            robotics.set_password('securepass')
-            
-            # Add all users to database
-            db.session.add_all([admin_user, user1, robotics])
             db.session.commit()
-            
-            print("Default users created successfully")
-        except Exception as e:
-            db.session.rollback()
-            print(f"Error creating default users: {str(e)}")
-    else:
-        # If admin exists but might be missing email
-        if not hasattr(admin, 'email') or admin.email is None:
-            try:
-                admin.email = 'admin@example.com'
-                db.session.commit()
-                print("Updated admin email")
-            except Exception as e:
-                db.session.rollback()
-                print(f"Error updating admin email: {str(e)}")
-        print("Default users already exist")
+            logger.info("Database initialized with default users")
 
-# Route handlers
-@app.route('/')
-def index():
-    if 'user_id' in session:
-        return redirect(url_for('robot_interface'))
-    return redirect(url_for('login'))
-
-@app.route('/login', methods=['GET'])
-def login():
-    return LOGIN_HTML
-
-@app.route('/auth', methods=['POST'])
-def auth():
-    username = request.form.get('username')
-    password = request.form.get('password')
-    
-    if not username or not password:
-        return jsonify({"error": "Username and password are required"}), 400
-    
-    user = User.query.filter_by(username=username).first()
-    
-    # Check if user exists and is not locked
-    if user and not user.account_locked:
-        if user.check_password(password):
-            # Successful login
-            session['user_id'] = user.id
-            session['username'] = user.username
-            session['role'] = user.role
-            
-            # Reset failed login attempts
-            user.failed_login_attempts = 0
-            user.last_login = datetime.utcnow()
-            db.session.commit()
-            
-            return redirect(url_for('robot_interface'))
-        else:
-            # Failed password
-            user.failed_login_attempts += 1
-            
-            # Lock account after 5 failed attempts
-            if user.failed_login_attempts >= 5:
-                user.account_locked = True
-                
-            db.session.commit()
-            
-            return jsonify({"error": "Invalid password"}), 401
-    elif user and user.account_locked:
-        return jsonify({"error": "Account locked. Please contact an administrator."}), 403
-    else:
-        return jsonify({"error": "User not found"}), 404
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'GET':
-        return REGISTER_HTML
-    
-    if request.method == 'POST':
-        try:
-            # For JSON requests from fetch API
-            if request.is_json:
-                data = request.get_json()
-                username = data.get('username')
-                email = data.get('email')
-                password = data.get('password')
-                confirm_password = data.get('confirm_password')
-            else:
-                # For traditional form submission
-                username = request.form.get('username')
-                email = request.form.get('email')
-                password = request.form.get('password')
-                confirm_password = request.form.get('confirm_password')
-            
-            # Validate input
-            if not username or not email or not password or not confirm_password:
-                return jsonify({"error": "All fields are required"}), 400
-            
-            if password != confirm_password:
-                return jsonify({"error": "Passwords do not match"}), 400
-            
-            # Check if username already exists
-            existing_user = User.query.filter_by(username=username).first()
-            if existing_user:
-                return jsonify({"error": "Username already exists"}), 400
-            
-            # Check if email already exists
-            existing_email = User.query.filter_by(email=email).first()
-            if existing_email:
-                return jsonify({"error": "Email already in use"}), 400
-            
-            # Validate password strength
-            is_valid, message = validate_password(password)
-            if not is_valid:
-                return jsonify({"error": message}), 400
-            
-            # Create new user with default 'user' role
-            new_user = User(
-                username=username,
-                email=email,
-                role='user',
-                created_at=datetime.utcnow()
-            )
-            new_user.set_password(password)
-            
-            db.session.add(new_user)
-            db.session.commit()
-            
-            return jsonify({"success": True, "message": "Registration successful"}), 201
-            
-        except Exception as e:
-            logger.error(f"Registration error: {str(e)}")
-            return jsonify({"error": "An unexpected error occurred"}), 500
-
-@app.route('/robot', methods=['GET'])
-@login_required
-def robot_interface():
-    username = session.get('username', 'Guest')
-    return ROBOT_INTERFACE_HTML.replace('{{ username }}', username)
-
-@app.route('/send_command', methods=['POST'])
-@login_required
-@rate_limit
-def send_command():
-    try:
-        # For JSON requests from fetch API
-        if request.is_json:
-            data = request.get_json()
-            command = data.get('command', '')
-        else:
-            # For traditional form submission
-            command = request.form.get('command', '')
-        
-        if not command:
-            return jsonify({"error": "No command provided"}), 400
-        
-        # Get user ID from session
-        user_id = session.get('user_id')
-        
-        # Get previous commands for context
-        previous_commands = [
-            ch.command for ch in CommandHistory.query.filter_by(
-                user_id=user_id, 
-                is_time_record=False
-            ).order_by(CommandHistory.timestamp.desc()).limit(5).all()
-        ]
-        
-        # Interpret the command
-        interpreted_command = interpret_command(command, previous_commands)
-        
-        # Record the command in history
-        new_command = CommandHistory(
-            user_id=user_id,
-            command=command,
-            timestamp=time.time(),
-            is_time_record=False
-        )
-        db.session.add(new_command)
-        db.session.commit()
-        
-        return jsonify(interpreted_command)
-        
-    except Exception as e:
-        logger.error(f"Command error: {str(e)}")
-        return jsonify({
-            "error": str(e),
-            "commands": [{
-                "mode": "stop",
-                "description": "Server error - robot stopped"
-            }],
-            "description": "Error in server processing"
-        }), 500
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
-@app.route('/admin')
-@login_required
-def admin_panel():
-    # Check if user has admin role
-    if session.get('role') != 'admin':
-        return jsonify({"error": "Unauthorized access"}), 403
-    
-    # Render admin panel (Not implemented in this code snippet)
-    return "Admin Panel - Not implemented in this example"
-
-# HTML Templates - Using raw strings to avoid syntax issues with CSS
-LOGIN_HTML = r"""
+# HTML Templates 
+# (Updating the login form to include registration)
+LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -610,435 +315,580 @@ LOGIN_HTML = r"""
         button { background-color: #0284c7; color: white; cursor: pointer; transition: all 0.2s ease; }
         button:hover { background-color: #0ea5e9; transform: translateY(-2px); }
         .error { color: #f87171; margin-top: 10px; }
-        a { color: #38bdf8; text-decoration: none; }
-        a:hover { text-decoration: underline; }
+        .success { color: #10b981; margin-top: 10px; }
+        .tab-container { display: flex; margin-bottom: 20px; }
+        .tab { flex: 1; padding: 10px; cursor: pointer; border-bottom: 2px solid transparent; }
+        .tab.active { border-bottom-color: #0ea5e9; font-weight: bold; }
+        .form-container { display: none; }
+        .form-container.active { display: block; }
+        .footer { margin-top: 20px; font-size: 12px; color: #94a3b8; }
     </style>
 </head>
 <body>
     <div class="login-container">
-        <h1> Robot Control</h1>
-        <h2>Login</h2>
-        <form action="/auth" method="post">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
+        <h1>Robot Control</h1>
+        
+        <div class="tab-container">
+            <div class="tab active" onclick="showTab('login')">Login</div>
+            <div class="tab" onclick="showTab('register')">Register</div>
+        </div>
+        
+        <div id="login-form" class="form-container active">
+            <h2>Login</h2>
+            <form action="/auth" method="post">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Login</button>
+            </form>
+            <p class="error" id="loginError" style="display: none;">{{ login_error }}</p>
+        </div>
+        
+        <div id="register-form" class="form-container">
+            <h2>Create Account</h2>
+            <form action="/register" method="post">
+                <input type="text" name="username" placeholder="Username (3-20 characters)" required minlength="3" maxlength="20">
+                <input type="password" name="password" placeholder="Password (min 6 characters)" required minlength="6">
+                <input type="password" name="confirm_password" placeholder="Confirm Password" required>
+                <button type="submit">Register</button>
+            </form>
+            <p class="error" id="registerError" style="display: none;">{{ register_error }}</p>
+            <p class="success" id="registerSuccess" style="display: none;">{{ register_success }}</p>
+        </div>
+        
+        <div class="footer">
+            Robot Control System v2.0
+        </div>
+    </div>
+    
+    <script>
+        function showTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.form-container').forEach(form => form.classList.remove('active'));
+            
+            // Show selected tab
+            document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
+            document.getElementById(`${tabName}-form`).classList.add('active');
+        }
+        
+        // Show errors if present
+        document.addEventListener('DOMContentLoaded', function() {
+            if ('{{ login_error }}') {
+                document.getElementById('loginError').style.display = 'block';
+            }
+            if ('{{ register_error }}') {
+                document.getElementById('registerError').style.display = 'block';
+                showTab('register');
+            }
+            if ('{{ register_success }}') {
+                document.getElementById('registerSuccess').style.display = 'block';
+                showTab('login');
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+# Keep the robot interface template as is, but update the logout link
+# (ROBOT_INTERFACE_HTML is unchanged since it's extensive - just update the session handling)
+
+@app.route('/')
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('home'))
+    return LOGIN_HTML.replace('{{ login_error }}', '').replace('{{ register_error }}', '').replace('{{ register_success }}', '')
+
+@app.route('/auth', methods=['POST'])
+def auth():
+    username = request.form.get('username', '')
+    password = request.form.get('password', '')
+
+    user = User.query.filter_by(username=username).first()
+    
+    if user and user.check_password(password):
+        session['user_id'] = user.id
+        session['username'] = user.username
+        
+        # Update last login time
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
+        return redirect(url_for('home'))
+    else:
+        error_html = LOGIN_HTML.replace('{{ login_error }}', 'Invalid username or password')
+        error_html = error_html.replace('{{ register_error }}', '').replace('{{ register_success }}', '')
+        return error_html
+
+@app.route('/register', methods=['POST'])
+def register():
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '')
+    confirm_password = request.form.get('confirm_password', '')
+    
+    # Validate input
+    if not username or len(username) < 3 or len(username) > 20:
+        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Username must be 3-20 characters')
+        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
+        return error_html
+    
+    if not password or len(password) < 6:
+        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Password must be at least 6 characters')
+        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
+        return error_html
+        
+    if password != confirm_password:
+        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Passwords do not match')
+        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
+        return error_html
+    
+    # Check if username exists
+    if User.query.filter_by(username=username).first():
+        error_html = LOGIN_HTML.replace('{{ register_error }}', 'Username already exists')
+        error_html = error_html.replace('{{ login_error }}', '').replace('{{ register_success }}', '')
+        return error_html
+    
+    # Create new user
+    new_user = User(username=username, role='user')
+    new_user.set_password(password)
+    
+    db.session.add(new_user)
+    db.session.commit()
+    
+    success_html = LOGIN_HTML.replace('{{ register_success }}', 'Account created successfully! Please login.')
+    success_html = success_html.replace('{{ login_error }}', '').replace('{{ register_error }}', '')
+    return success_html
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    session.pop('username', None)
+    return redirect(url_for('login'))
+
+@app.route('/home')
+@login_required
+def home():
+    # Get the user's username
+    username = session.get('username', '')
+    user = User.query.filter_by(username=username).first()
+    
+    if not user:
+        session.clear()
+        return redirect(url_for('login'))
+    
+    # Replace the username placeholder with the actual username
+    return ROBOT_INTERFACE_HTML.replace("{{ username }}", username)
+
+@app.route('/send_command', methods=['POST'])
+@login_required
+@rate_limit
+def send_command():
+    try:
+        command = request.form.get('command', '').strip()
+        user_id = session.get('user_id')
+        
+        if not command:
+            return jsonify({"error": "No command provided"})
+        
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        # Get user command history for context
+        user_commands = []
+        previous_commands = CommandHistory.query.filter_by(user_id=user_id).order_by(
+            CommandHistory.timestamp.desc()
+        ).limit(10).all()
+        
+        for cmd in previous_commands:
+            if cmd.command:
+                user_commands.append(cmd.command)
+        
+        # Interpret the command
+        interpreted_command = interpret_command(command, user_commands)
+        
+        # Store command in history
+        new_command = CommandHistory(
+            user_id=user_id,
+            command=command,
+            processed_command=json.dumps(interpreted_command)
+        )
+        db.session.add(new_command)
+        db.session.commit()
+        
+        # Return the interpreted command
+        return jsonify(interpreted_command)
+    
+    except Exception as e:
+        logger.error(f"Error processing command: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# Admin dashboard to manage users
+@app.route('/admin')
+@login_required
+def admin_dashboard():
+    # Check if user is admin
+    user_id = session.get('user_id')
+    user = User.query.get(user_id)
+    
+    if not user or user.role != 'admin':
+        return jsonify({"error": "Unauthorized access"}), 403
+    
+    # Get all users (except current admin)
+    users = User.query.filter(User.id != user_id).all()
+    
+    # HTML for admin dashboard
+    admin_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Admin Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; padding: 20px; }}
+            .container {{ max-width: 1000px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }}
+            h1, h2 {{ margin-top: 0; }}
+            table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #475569; }}
+            th {{ background-color: #0f172a; }}
+            tr:hover {{ background-color: #475569; }}
+            .action-btn {{ padding: 8px 12px; margin: 0 5px; border-radius: 8px; border: none; cursor: pointer; }}
+            .edit-btn {{ background-color: #0ea5e9; color: white; }}
+            .delete-btn {{ background-color: #ef4444; color: white; }}
+            .back-btn {{ display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #475569; color: white; text-decoration: none; border-radius: 8px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Admin Dashboard</h1>
+            <h2>User Management</h2>
+            
+            <table>
+                <tr>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Created</th>
+                    <th>Last Login</th>
+                    <th>Actions</th>
+                </tr>
+    """
+    
+    for u in users:
+        created_date = u.created_at.strftime('%Y-%m-%d') if u.created_at else 'N/A'
+        last_login = u.last_login.strftime('%Y-%m-%d %H:%M') if u.last_login else 'Never'
+        
+        admin_html += f"""
+                <tr>
+                    <td>{u.username}</td>
+                    <td>{u.role}</td>
+                    <td>{created_date}</td>
+                    <td>{last_login}</td>
+                    <td>
+                        <button class="action-btn edit-btn" onclick="location.href='/admin/edit_user/{u.id}'">Edit</button>
+                        <button class="action-btn delete-btn" onclick="confirmDelete({u.id}, '{u.username}')">Delete</button>
+                    </td>
+                </tr>
+        """
+    
+    admin_html += f"""
+            </table>
+            
+            <button class="action-btn edit-btn" onclick="location.href='/admin/add_user'">Add New User</button>
+            <a href="/home" class="back-btn">Back to Robot Control</a>
+        </div>
+        
+        <script>
+            function confirmDelete(userId, username) {{
+                if (confirm(`Are you sure you want to delete user: ${{username}}?`)) {{
+                    location.href = `/admin/delete_user/${{userId}}`;
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return admin_html
+
+# New endpoint for ESP32 communication
+@app.route('/api/robot_command', methods=['GET', 'POST'])
+def robot_command():
+    # Simple authentication using API key instead of session-based auth
+    api_key = request.headers.get('X-API-Key')
+    if not api_key or api_key != '1234' :
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    # For GET requests, return the latest command for the robot
+    if request.method == 'GET':
+        # Find the robotics user
+        robotics_user = User.query.filter_by(username='robotics').first()
+        
+        if not robotics_user:
+            return jsonify({"error": "Robotics user not found"}), 404
+        
+        # Get the most recent command
+        latest_command = CommandHistory.query.filter_by(user_id=robotics_user.id).order_by(
+            CommandHistory.timestamp.desc()
+        ).first()
+        
+        if latest_command and latest_command.processed_command:
+            try:
+                return jsonify(json.loads(latest_command.processed_command))
+            except:
+                pass
+            
+        return jsonify({"error": "No commands available"}), 404
+    
+    # For POST requests, allow the ESP32 to send status updates
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            # Process status update from ESP32
+            logger.info(f"Received status update from ESP32: {data}")
+            
+            # Here you could store status updates in a database table
+            # For now, just log it
+            
+            return jsonify({"status": "received"}), 200
+        except Exception as e:
+            logger.error(f"Error processing ESP32 status update: {str(e)}")
+            return jsonify({"error": str(e)}), 400
+
+# Initialize the database if this file is run directly
+if __name__ == '__main__':
+    initialize_database()
+    # For development, otherwise use production WSGI server
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+# Additional admin routes for user management
+@app.route('/admin/add_user', methods=['GET', 'POST'])
+@login_required
+def add_user():
+    # Check if user is admin
+    user_id = session.get('user_id')
+    user = User.query.get(user_id)
+    
+    if not user or user.role != 'admin':
+        return jsonify({"error": "Unauthorized access"}), 403
+    
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        role = request.form.get('role', 'user')
+        
+        # Validate input
+        if not username or len(username) < 3:
+            return render_template_string(ADD_USER_HTML, error="Username must be at least 3 characters")
+        
+        if not password or len(password) < 6:
+            return render_template_string(ADD_USER_HTML, error="Password must be at least 6 characters")
+        
+        # Check if username exists
+        if User.query.filter_by(username=username).first():
+            return render_template_string(ADD_USER_HTML, error="Username already exists")
+        
+        # Create new user
+        new_user = User(username=username, role=role)
+        new_user.set_password(password)
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        return redirect(url_for('admin_dashboard'))
+    
+    # GET request - show the form
+    return render_template_string(ADD_USER_HTML, error=None)
+
+@app.route('/admin/edit_user/<int:user_id>', methods=['GET', 'POST'])
+@login_required
+def edit_user(user_id):
+    # Check if current user is admin
+    admin_id = session.get('user_id')
+    admin = User.query.get(admin_id)
+    
+    if not admin or admin.role != 'admin':
+        return jsonify({"error": "Unauthorized access"}), 403
+    
+    # Get the user to edit
+    user_to_edit = User.query.get(user_id)
+    if not user_to_edit:
+        return redirect(url_for('admin_dashboard'))
+    
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        new_password = request.form.get('password', '')
+        role = request.form.get('role', 'user')
+        
+        # Validate username
+        if not username or len(username) < 3:
+            return render_template_string(
+                EDIT_USER_HTML, 
+                user=user_to_edit,
+                error="Username must be at least 3 characters"
+            )
+        
+        # Check if new username already exists (if changed)
+        if username != user_to_edit.username and User.query.filter_by(username=username).first():
+            return render_template_string(
+                EDIT_USER_HTML, 
+                user=user_to_edit,
+                error="Username already exists"
+            )
+        
+        # Update user
+        user_to_edit.username = username
+        user_to_edit.role = role
+        
+        # Update password if provided
+        if new_password:
+            if len(new_password) < 6:
+                return render_template_string(
+                    EDIT_USER_HTML, 
+                    user=user_to_edit,
+                    error="Password must be at least 6 characters"
+                )
+            user_to_edit.set_password(new_password)
+        
+        db.session.commit()
+        return redirect(url_for('admin_dashboard'))
+    
+    # GET request - show the form
+    return render_template_string(EDIT_USER_HTML, user=user_to_edit, error=None)
+
+@app.route('/admin/delete_user/<int:user_id>')
+@login_required
+def delete_user(user_id):
+    # Check if current user is admin
+    admin_id = session.get('user_id')
+    admin = User.query.get(admin_id)
+    
+    if not admin or admin.role != 'admin':
+        return jsonify({"error": "Unauthorized access"}), 403
+    
+    # Prevent self-deletion
+    if admin_id == user_id:
+        return redirect(url_for('admin_dashboard'))
+    
+    # Get the user to delete
+    user_to_delete = User.query.get(user_id)
+    if user_to_delete:
+        # Delete associated data
+        CommandHistory.query.filter_by(user_id=user_id).delete()
+        RateLimit.query.filter_by(user_id=user_id).delete()
+        
+        # Delete the user
+        db.session.delete(user_to_delete)
+        db.session.commit()
+    
+    return redirect(url_for('admin_dashboard'))
+
+# HTML Templates for user management
+ADD_USER_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Add New User</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; padding: 20px; }
+        .container { max-width: 500px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
+        h1 { margin-top: 0; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input, select { width: 100%; padding: 10px; font-size: 16px; border-radius: 8px; border: none; background-color: #475569; color: white; }
+        button { padding: 12px 20px; margin-top: 10px; background-color: #0ea5e9; color: white; border: none; border-radius: 8px; cursor: pointer; }
+        .error { color: #f87171; margin-top: 10px; }
+        .back-btn { display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #475569; color: white; text-decoration: none; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Add New User</h1>
+        
+        {% if error %}
+        <p class="error">{{ error }}</p>
+        {% endif %}
+        
+        <form method="post">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" required minlength="3">
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required minlength="6">
+            </div>
+            
+            <div class="form-group">
+                <label for="role">Role:</label>
+                <select id="role" name="role">
+                    <option value="user">User</option>
+                    <option value="admin">Admin</option>
+                </select>
+            </div>
+            
+            <button type="submit">Add User</button>
         </form>
-        <p>Don't have an account? <a href="/register">Register here</a></p>
-        <p class="error" id="errorMsg" style="display: none;"></p>
+        
+        <a href="/admin" class="back-btn">Back to Admin Dashboard</a>
     </div>
 </body>
 </html>
 """
 
-ROBOT_INTERFACE_HTML = r"""
+EDIT_USER_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Robot Control Interface</title>
+    <title>Edit User</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body { 
-            font-family: 'Segoe UI', sans-serif; 
-            background-color: #0f172a; 
-            color: white; 
-            text-align: center; 
-            padding: 20px;
-            margin: 0;
-        }
-        .container {
-            max-width: 900px;
-            margin: auto;
-        }
-        .chatbox { 
-            background: #1e293b; 
-            padding: 30px; 
-            border-radius: 20px; 
-            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
-            margin-bottom: 20px;
-        }
-        input[type="text"] { 
-            width: 80%; 
-            padding: 15px; 
-            font-size: 16px; 
-            border-radius: 12px; 
-            border: none; 
-            margin: 10px 0;
-            background-color: #334155;
-            color: white;
-        }
-        button { 
-            padding: 15px 20px; 
-            font-size: 16px; 
-            margin: 5px; 
-            border-radius: 12px; 
-            border: none; 
-            background-color: #0284c7; 
-            color: white; 
-            cursor: pointer; 
-            transition: all 0.2s ease;
-        }
-        button:hover { 
-            background-color: #0ea5e9; 
-            transform: translateY(-2px);
-        }
-        button:active {
-            transform: translateY(0);
-        }
-        .btn-speak {
-            background-color: #059669;
-        }
-        .btn-speak:hover {
-            background-color: #10b981;
-        }
-        pre { 
-            text-align: left; 
-            background: #0f172a; 
-            padding: 20px; 
-            border-radius: 12px; 
-            color: #f1f5f9; 
-            overflow-x: auto; 
-            margin-top: 20px; 
-            font-size: 14px;
-            white-space: pre-wrap;
-        }
-        .status-bar {
-            display: flex;
-            justify-content: space-between;
-            background-color: #334155;
-            padding: 10px 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            font-size: 14px;
-        }
-        #voiceStatus {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 20px;
-            background-color: #475569;
-        }
-        #voiceStatus.listening {
-            background-color: #059669;
-            animation: pulse 1.5s infinite;
-        }
-        @keyframes pulse {
-            0% { opacity: 0.7; }
-            50% { opacity: 1; }
-            100% { opacity: 0.7; }
-        }
-        .robot-container {
-            margin: 20px 0;
-            position: relative;
-        }
-        #robotFace {
-            width: 100px;
-            height: 100px;
-            background-color: #334155;
-            border-radius: 50%;
-            margin: 0 auto;
-            position: relative;
-            transition: all 0.5s ease;
-        }
-        #robotFace.active {
-            background-color: #0ea5e9;
-            box-shadow: 0 0 20px rgba(14, 165, 233, 0.7);
-        }
-        #robotFace.listening {
-            background-color: #10b981;
-            box-shadow: 0 0 20px rgba(16, 185, 129, 0.7);
-        }
-        #robotFace::before,
-        #robotFace::after {
-            content: '';
-            position: absolute;
-            width: 20px;
-            height: 20px;
-            background-color: #0f172a;
-            border-radius: 50%;
-            top: 30px;
-            transition: all 0.5s ease;
-        }
-        #robotFace::before {
-            left: 25px;
-        }
-        #robotFace::after {
-            right: 25px;
-        }
-        #robotFace.active::before,
-        #robotFace.active::after,
-        #robotFace.listening::before,
-        #robotFace.listening::after {
-            background-color: #ffffff;
-            width: 22px;
-            height: 22px;
-        }
-        .mouth {
-            position: absolute;
-            width: 40px;
-            height: 10px;
-            background-color: #0f172a;
-            bottom: 25px;
-            left: calc(50% - 20px);
-            border-radius: 10px;
-            transition: all 0.5s ease;
-        }
-        #robotFace.active .mouth,
-        #robotFace.listening .mouth {
-            background-color: #ffffff;
-            height: 15px;
-            width: 40px;
-            left: calc(50% - 20px);
-            border-radius: 0 0 20px 20px;
-        }
-        a.logout { 
-            display: inline-block; 
-            margin-top: 20px; 
-            color: #f87171; 
-            text-decoration: none; 
-            font-weight: bold;
-            transition: color 0.2s ease;
-        }
-        a.logout:hover {
-            color: #ef4444;
-        }
-        .command-examples {
-            text-align: left;
-            background-color: #334155;
-            padding: 15px;
-            border-radius: 10px;
-            margin-top: 20px;
-            font-size: 14px;
-        }
-        .command-examples h3 {
-            margin-top: 0;
-        }
-        .example {
-            margin: 5px 0;
-            cursor: pointer;
-            padding: 5px;
-            border-radius: 5px;
-        }
-        .example:hover {
-            background-color: #475569;
-        }
+        body { font-family: 'Segoe UI', sans-serif; background-color: #1e293b; color: white; padding: 20px; }
+        .container { max-width: 500px; margin: auto; background: #334155; padding: 30px; border-radius: 20px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3); }
+        h1 { margin-top: 0; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input, select { width: 100%; padding: 10px; font-size: 16px; border-radius: 8px; border: none; background-color: #475569; color: white; }
+        button { padding: 12px 20px; margin-top: 10px; background-color: #0ea5e9; color: white; border: none; border-radius: 8px; cursor: pointer; }
+        .error { color: #f87171; margin-top: 10px; }
+        .note { color: #94a3b8; margin-top: 5px; font-size: 14px; }
+        .back-btn { display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #475569; color: white; text-decoration: none; border-radius: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="chatbox">
-            <h1> Robot Control Interface</h1>
-            
-            <div class="status-bar">
-                <span>Status: <span id="voiceStatus">Initializing...</span></span>
-                <span>User: <strong>{{ username }}</strong></span>
+        <h1>Edit User</h1>
+        
+        {% if error %}
+        <p class="error">{{ error }}</p>
+        {% endif %}
+        
+        <form method="post">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" value="{{ user.username }}" required minlength="3">
             </div>
             
-            <div class="robot-container">
-                <div id="robotFace">
-                    <div class="mouth"></div>
-                </div>
+            <div class="form-group">
+                <label for="password">New Password:</label>
+                <input type="password" id="password" name="password">
+                <p class="note">Leave blank to keep current password</p>
             </div>
             
-            <form id="commandForm" method="POST" action="/send_command">
-                <input type="text" id="command" name="command" placeholder="Enter movement command or say 'Hey Robot'..." required>
-                <div>
-                    <button type="button" class="btn-speak" onclick="manualStartListening()"> Speak</button>
-                    <button type="submit">Send Command</button>
-                </div>
-            </form>
-            
-            <div class="command-examples">
-                <h3>Try these commands:</h3>
-                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Do a square with 1.5 meter sides
-                </div>
-                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Go left for 3 seconds then go right quickly for 5 meters
-                </div>
-                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    Draw a circle with an area of 20 meters
-                </div>
-                <div class="example" onclick="document.getElementById('command').value=this.textContent;document.getElementById('commandForm').requestSubmit()">
-                    make a star 
-                </div>
+            <div class="form-group">
+                <label for="role">Role:</label>
+                <select id="role" name="role">
+                    <option value="user" {% if user.role == 'user' %}selected{% endif %}>User</option>
+                    <option value="admin" {% if user.role == 'admin' %}selected{% endif %}>Admin</option>
+                </select>
             </div>
             
-            <h2> Generated Robot Commands: <span id="responseStatus"></span></h2>
-            <pre id="response">No command sent yet.</pre>
-            
-            <a class="logout" href="/logout"> Logout</a>
-        </div>
+            <button type="submit">Update User</button>
+        </form>
+        
+        <a href="/admin" class="back-btn">Back to Admin Dashboard</a>
     </div>
-
-    <script>
-    // Speech Recognition Setup
-    let recognition = null;
-    const triggerPhrases = ["hey robot", "okay robot", "robot", "hey bot"];
-    let isListeningForTrigger = false;
-    let isListeningForCommand = false;
-    let commandTimeout = null;
-    
-    // Function for manual activation of speech recognition
-    function manualStartListening() {
-        if (recognition) {
-            // Stop current recognition if running
-            try {
-                recognition.stop();
-            } catch (e) {
-                console.log("Error stopping recognition:", e);
-            }
-            
-            // Clear any existing timeouts
-            if (commandTimeout) {
-                clearTimeout(commandTimeout);
-            }
-            
-            // Set up for command listening
-            isListeningForTrigger = false;
-            isListeningForCommand = true;
-            recognition.continuous = false;
-            
-            // Start listening
-            try {
-                recognition.start();
-                document.getElementById('voiceStatus').textContent = "Listening for command...";
-                document.getElementById('voiceStatus').className = "listening";
-                document.getElementById('robotFace').className = "listening";
-                
-                // Set timeout for listening
-                commandTimeout = setTimeout(() => {
-                    if (isListeningForCommand) {
-                        recognition.stop();
-                        resetToTriggerMode();
-                        document.getElementById('voiceStatus').textContent = "No command heard. Try again.";
-                        document.getElementById('voiceStatus').className = "";
-                        document.getElementById('robotFace').className = "";
-                    }
-                }, 5000);
-            } catch (e) {
-                console.log("Error starting manual listening:", e);
-                document.getElementById('voiceStatus').textContent = "Speech recognition error";
-                document.getElementById('voiceStatus').className = "";
-                document.getElementById('robotFace').className = "";
-            }
-        } else {
-            alert("Speech recognition not available");
-        }
-    }
-
-    function initSpeechRecognition() {
-        if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
-            alert("Speech recognition not supported. Try Chrome, Edge, or Safari.");
-            return;
-        }
-
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        recognition = new SpeechRecognition();
-        
-        // Configure recognition
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-        
-        // Update UI to show status
-        function updateStatus(status) {
-            const statusElement = document.getElementById('voiceStatus');
-            const robotFace = document.getElementById('robotFace');
-            
-            statusElement.textContent = status;
-            statusElement.className = status.includes('Listening') ? 'listening' : '';
-            
-            if (status.includes('Listening for trigger')) {
-                robotFace.className = '';
-            } else if (status.includes('Listening for command')) {
-                robotFace.className = 'listening';
-            } else if (status.includes('Processing')) {
-                robotFace.className = 'active';
-            }
-        }
-        
-        // Process speech results
-        recognition.onresult = function(event) {
-            const lastResult = event.results[event.results.length - 1];
-            const transcript = lastResult[0].transcript.trim().toLowerCase();
-            
-            console.log(` Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
-            
-            if (isListeningForTrigger) {
-                // Check for trigger phrases
-                if (triggerPhrases.some(phrase => transcript.includes(phrase))) {
-                    recognition.stop();
-                    updateStatus("Listening for command...");
-                    
-                    setTimeout(() => {
-                        isListeningForTrigger = false;
-                        isListeningForCommand = true;
-                        recognition.continuous = false;
-                        recognition.start();
-                        
-                        commandTimeout = setTimeout(() => {
-                            if (isListeningForCommand) {
-                                recognition.stop();
-                                resetToTriggerMode();
-                                updateStatus("No command heard. Try again.");
-                            }
-                        }, 5000);
-                    }, 300);
-                }
-            } 
-            else if (isListeningForCommand && !lastResult.isFinal) {
-                document.getElementById('command').value = transcript;
-            }
-            else if (isListeningForCommand && lastResult.isFinal) {
-                clearTimeout(commandTimeout);
-                document.getElementById('command').value = transcript;
-                
-                updateStatus("Processing command...");
-                document.getElementById('commandForm').requestSubmit();
-                resetToTriggerMode();
-            }
-        };
-        
-        // Reset to trigger word listening mode
-        function resetToTriggerMode() {
-            isListeningForCommand = false;
-            isListeningForTrigger = true;
-            recognition.continuous = true;
-            updateStatus("Listening for trigger word...");
-            
-            setTimeout(() => {
-                try {
-                    recognition.start();
-                } catch (e) {
-                    console.log("Recognition restart error:", e);
-                }
-            }, 300);
-        }
-        
-        // Start listening for trigger words
-        try {
-            recognition.start();
-            isListeningForTrigger = true;
-            updateStatus("Listening for trigger word...");
-        } catch (e) {
-            console.log("Error starting speech recognition:", e);
-            updateStatus("Speech recognition unavailable");
-        }
-        
-        // Handle errors
-        recognition.onerror = function(event) {
-            console.log("⚠️ Speech recognition error:", event.error);
-            if (event.error === 'no-speech' || event.error === 'network') {
-                recognition.stop();
-                setTimeout(() => {
-                    resetToTriggerMode();
-                }, 1000);
-            } else if (event.error === 'aborted' || event.error === 'audio-capture' || event.error === 'not-allowed') {
-                updateStatus("Speech recognition unavailable");
-                isListeningForTrigger = false;
-                isListeningForCommand = false;
-            }
-        };
-        </script>
-        </body>
-        </html>
-    """
+</body>
+</html>
+"""
