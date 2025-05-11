@@ -9,8 +9,3 @@ services:
         sync: false
       - key: SECRET_KEY
         generateValue: true
-      - key: DATABASE_URL
-        fromService:
-          type: database
-          name: robot-db
-          property: connectionString
