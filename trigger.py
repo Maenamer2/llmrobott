@@ -787,3 +787,113 @@ def robot_command():
 if __name__ == '__main__':
     # For development, otherwise use production WSGI server
     app.run(debug=True, host='0.0.0.0', port=5000)
+from user_management import add_user, list_users, delete_user, change_password, change_role
+
+# Admin-only decorator
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user' not in session:
+            return jsonify({"error": "Authentication required"}), 401
+        
+        # Check if user is admin
+        db_path = get_db_path()
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT role FROM users WHERE username = ?', (session['user'],))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result or result[0] != 'admin':
+            return jsonify({"error": "Admin privileges required"}), 403
+            
+        return f(*args, **kwargs)
+    return decorated_function
+
+# User management routes
+@app.route('/admin/users', methods=['GET'])
+@login_required
+@admin_required
+def admin_list_users():
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, username, role FROM users ORDER BY username')
+    users = cursor.fetchall()
+    conn.close()
+    
+    user_list = [{"id": user[0], "username": user[1], "role": user[2]} for user in users]
+    return jsonify({"users": user_list})
+
+@app.route('/admin/users/add', methods=['POST'])
+@login_required
+@admin_required
+def admin_add_user():
+    data = request.get_json()
+    if not data or not all(k in data for k in ('username', 'password', 'role')):
+        return jsonify({"error": "Missing required fields"}), 400
+    
+    if data['role'] not in ['admin', 'user']:
+        return jsonify({"error": "Invalid role. Must be 'admin' or 'user'"}), 400
+    
+    success = add_user(data['username'], data['password'], data['role'])
+    if success:
+        return jsonify({"message": f"User '{data['username']}' added successfully"})
+    else:
+        return jsonify({"error": "Failed to add user"}), 400
+
+@app.route('/admin/users/<username>/delete', methods=['POST'])
+@login_required
+@admin_required
+def admin_delete_user(username):
+    if username == session['user']:
+        return jsonify({"error": "Cannot delete your own account"}), 400
+    
+    success = delete_user(username)
+    if success:
+        return jsonify({"message": f"User '{username}' deleted successfully"})
+    else:
+        return jsonify({"error": f"Failed to delete user '{username}'"}), 400
+
+@app.route('/admin/users/<username>/password', methods=['POST'])
+@login_required
+@admin_required
+def admin_change_password(username):
+    data = request.get_json()
+    if not data or 'password' not in data:
+        return jsonify({"error": "Missing password field"}), 400
+    
+    success = change_password(username, data['password'])
+    if success:
+        return jsonify({"message": f"Password for user '{username}' updated successfully"})
+    else:
+        return jsonify({"error": f"Failed to update password for user '{username}'"}), 400
+
+@app.route('/admin/users/<username>/role', methods=['POST'])
+@login_required
+@admin_required
+def admin_change_role(username):
+    data = request.get_json()
+    if not data or 'role' not in data:
+        return jsonify({"error": "Missing role field"}), 400
+    
+    if data['role'] not in ['admin', 'user']:
+        return jsonify({"error": "Invalid role. Must be 'admin' or 'user'"}), 400
+    
+    if username == session['user'] and data['role'] != 'admin':
+        return jsonify({"error": "Cannot remove admin role from your own account"}), 400
+    
+    success = change_role(username, data['role'])
+    if success:
+        return jsonify({"message": f"Role for user '{username}' updated to '{data['role']}' successfully"})
+    else:
+        return jsonify({"error": f"Failed to update role for user '{username}'"}), 400
+
+# Optional: Admin dashboard route
+@app.route('/admin')
+@login_required
+@admin_required
+def admin_dashboard():
+    # You could create an admin dashboard HTML template
+    # For now, we'll just redirect to the regular home page
+    return redirect(url_for('home'))
