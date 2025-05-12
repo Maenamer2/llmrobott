@@ -6,7 +6,9 @@ import os
 import time
 import logging
 import re
+import sqlite3
 from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -21,12 +23,58 @@ app.secret_key = os.getenv("SECRET_KEY", "your_secret_key")  # Better to use env
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Improved data structure for users (in production, use a proper database)
-USERS = {
-    "maen": {"password": "maen", "role": "admin"},
-    "user1": {"password": "password1", "role": "user"},
-    "robotics": {"password": "securepass", "role": "user"}
-}
+# Initialize and configure the SQLite database
+def init_db():
+    conn = sqlite3.connect('robot_control.db')
+    cursor = conn.cursor()
+    
+    # Create users table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL
+    )
+    ''')
+    
+    # Add default users
+    default_users = [
+        ('maen', generate_password_hash('maen'), 'admin'),
+        ('user1', generate_password_hash('password1'), 'user'),
+        ('robotics', generate_password_hash('securepass'), 'user'),
+        ('guest', generate_password_hash('guest123'), 'user')
+    ]
+    
+    # Insert default users, ignore if they already exist
+    for user in default_users:
+        try:
+            cursor.execute('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)', user)
+        except sqlite3.IntegrityError:
+            # User already exists, skip
+            pass
+    
+    conn.commit()
+    conn.close()
+    
+    logger.info("Database initialized with default users")
+
+# Initialize database on application startup
+init_db()
+
+# Function to authenticate users
+def authenticate_user(username, password):
+    conn = sqlite3.connect('robot_control.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT password_hash, role FROM users WHERE username = ?', (username,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and check_password_hash(result[0], password):
+        return {'username': username, 'role': result[1]}
+    
+    return None
 
 # Command history for audit and improved responses
 command_history = {}
@@ -51,11 +99,20 @@ def rate_limit(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         user = session.get('user')
-        if not user or user not in USERS:
+        if not user:
             return jsonify({"error": "Authentication required"}), 401
         
-        # Get user's role and corresponding rate limit
-        role = USERS[user].get('role', 'user')
+        # Get user's role
+        conn = sqlite3.connect('robot_control.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT role FROM users WHERE username = ?', (user,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return jsonify({"error": "User not found"}), 401
+        
+        role = result[0]
         limit = rate_limits.get(role, rate_limits['user'])
         
         # Initialize history if not exists
@@ -242,7 +299,7 @@ LOGIN_HTML = """
 </head>
 <body>
     <div class="login-container">
-        <h1> Robot Control</h1>
+        <h1>Robot Control</h1>
         <h2>Login</h2>
         <form action="/auth" method="post">
             <input type="text" name="username" placeholder="Username" required>
@@ -350,70 +407,6 @@ ROBOT_INTERFACE_HTML = """
             50% { opacity: 1; }
             100% { opacity: 0.7; }
         }
-        .robot-container {
-            margin: 20px 0;
-            position: relative;
-        }
-        #robotFace {
-            width: 100px;
-            height: 100px;
-            background-color: #334155;
-            border-radius: 50%;
-            margin: 0 auto;
-            position: relative;
-            transition: all 0.5s ease;
-        }
-        #robotFace.active {
-            background-color: #0ea5e9;
-            box-shadow: 0 0 20px rgba(14, 165, 233, 0.7);
-        }
-        #robotFace.listening {
-            background-color: #10b981;
-            box-shadow: 0 0 20px rgba(16, 185, 129, 0.7);
-        }
-        #robotFace::before,
-        #robotFace::after {
-            content: '';
-            position: absolute;
-            width: 20px;
-            height: 20px;
-            background-color: #0f172a;
-            border-radius: 50%;
-            top: 30px;
-            transition: all 0.5s ease;
-        }
-        #robotFace::before {
-            left: 25px;
-        }
-        #robotFace::after {
-            right: 25px;
-        }
-        #robotFace.active::before,
-        #robotFace.active::after,
-        #robotFace.listening::before,
-        #robotFace.listening::after {
-            background-color: #ffffff;
-            width: 22px;
-            height: 22px;
-        }
-        .mouth {
-            position: absolute;
-            width: 40px;
-            height: 10px;
-            background-color: #0f172a;
-            bottom: 25px;
-            left: calc(50% - 20px);
-            border-radius: 10px;
-            transition: all 0.5s ease;
-        }
-        #robotFace.active .mouth,
-        #robotFace.listening .mouth {
-            background-color: #ffffff;
-            height: 15px;
-            width: 40px;
-            left: calc(50% - 20px);
-            border-radius: 0 0 20px 20px;
-        }
         a.logout { 
             display: inline-block; 
             margin-top: 20px; 
@@ -450,23 +443,17 @@ ROBOT_INTERFACE_HTML = """
 <body>
     <div class="container">
         <div class="chatbox">
-            <h1> Robot Control Interface</h1>
+            <h1>Robot Control Interface</h1>
             
             <div class="status-bar">
                 <span>Status: <span id="voiceStatus">Initializing...</span></span>
                 <span>User: <strong>{{ username }}</strong></span>
             </div>
             
-            <div class="robot-container">
-                <div id="robotFace">
-                    <div class="mouth"></div>
-                </div>
-            </div>
-            
             <form id="commandForm" method="POST" action="/send_command">
                 <input type="text" id="command" name="command" placeholder="Enter movement command or say 'Hey Robot'..." required>
                 <div>
-                    <button type="button" class="btn-speak" onclick="manualStartListening()"> Speak</button>
+                    <button type="button" class="btn-speak" onclick="manualStartListening()">Speak</button>
                     <button type="submit">Send Command</button>
                 </div>
             </form>
@@ -487,10 +474,10 @@ ROBOT_INTERFACE_HTML = """
                 </div>
             </div>
             
-            <h2> Generated Robot Commands: <span id="responseStatus"></span></h2>
+            <h2>Generated Robot Commands: <span id="responseStatus"></span></h2>
             <pre id="response">No command sent yet.</pre>
             
-            <a class="logout" href="/logout"> Logout</a>
+            <a class="logout" href="/logout">Logout</a>
         </div>
     </div>
 
@@ -519,18 +506,9 @@ ROBOT_INTERFACE_HTML = """
         // Update UI to show status
         function updateStatus(status) {
             const statusElement = document.getElementById('voiceStatus');
-            const robotFace = document.getElementById('robotFace');
             
             statusElement.textContent = status;
             statusElement.className = status.includes('Listening') ? 'listening' : '';
-            
-            if (status.includes('Listening for trigger')) {
-                robotFace.className = '';
-            } else if (status.includes('Listening for command')) {
-                robotFace.className = 'listening';
-            } else if (status.includes('Processing')) {
-                robotFace.className = 'active';
-            }
         }
         
         // Process speech results
@@ -538,7 +516,7 @@ ROBOT_INTERFACE_HTML = """
             const lastResult = event.results[event.results.length - 1];
             const transcript = lastResult[0].transcript.trim().toLowerCase();
             
-            console.log(` Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
+            console.log(`Heard: "${transcript}" (Confidence: ${lastResult[0].confidence.toFixed(2)})`);
             
             if (isListeningForTrigger) {
                 // Check for trigger phrases
@@ -634,7 +612,7 @@ ROBOT_INTERFACE_HTML = """
         isListeningForTrigger = false;
         isListeningForCommand = true;
         document.getElementById('voiceStatus').textContent = "Listening for command...";
-        document.getElementById('robotFace').className = 'listening';
+        document.getElementById('voiceStatus').className = 'listening';
         
         commandTimeout = setTimeout(() => {
             if (isListeningForCommand) {
@@ -697,7 +675,9 @@ def auth():
     username = request.form.get('username', '')
     password = request.form.get('password', '')
 
-    if username in USERS and USERS[username]["password"] == password:
+    # Use the new authenticate_user function
+    user_data = authenticate_user(username, password)
+    if user_data:
         session['user'] = username
         return redirect(url_for('home'))
     else:
@@ -760,7 +740,7 @@ def send_command():
 def robot_command():
     # Simple authentication using API key instead of session-based auth
     api_key = request.headers.get('X-API-Key')
-    if not api_key or api_key != '1234' :
+    if not api_key or api_key != '1234':
         return jsonify({"error": "Invalid API key"}), 401
     
     # For GET requests, return the latest command for the robot
