@@ -1,15 +1,18 @@
 services:
   - type: web
-    name: robot-control
+    name: robot-control-system
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn 'app:create_app()' --workers 2 --threads 2 --timeout 60 --access-logfile '-' --error-logfile '-' --bind 0.0.0.0:$PORT
+    plan: free
+    healthCheckPath: /
     envVars:
       - key: OPENAI_API_KEY
         sync: false
       - key: SECRET_KEY
         generateValue: true
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
+      - key: API_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    autoDeploy: true
