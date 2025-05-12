@@ -1,11 +1,15 @@
 services:
   - type: web
-    name: robot-chatbot
+    name: robot-control
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn trigger:app"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
     envVars:
       - key: OPENAI_API_KEY
         sync: false
       - key: SECRET_KEY
         generateValue: true
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
